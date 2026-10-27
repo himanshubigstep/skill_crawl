@@ -1,0 +1,7 @@
+{
+  "name": "skillcrawl",
+  "version": "0.1.0",
+  "description": "Checks website pages against a source document for spelling, grammar, punctuation and content mismatches. Batches of 5 pages, developer reports, and re-check runs.",
+  "commands": ["commands/"],
+  "skills": ["skills/"]
+}

@@ -1,0 +1,3 @@
+# Every day at 09:00 - re-check the site and regenerate reports if problems remain.
+# Edit the path, then install with:  crontab -e
+0 9 * * * /path/to/skillcrawl/scheduler/run_recheck.sh /path/to/your/project

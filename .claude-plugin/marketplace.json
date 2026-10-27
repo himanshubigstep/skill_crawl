@@ -1,0 +1,11 @@
+{
+  "name": "skillcrawl-marketplace",
+  "owner": { "name": "Your Team" },
+  "plugins": [
+    {
+      "name": "skillcrawl",
+      "source": "./plugins/skillcrawl",
+      "description": "Checks every page of a website against a source document (spelling, grammar, punctuation, factual match) in batches of 5 and generates developer reports, with re-check support."
+    }
+  ]
+}
