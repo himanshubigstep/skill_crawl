@@ -1,7 +1,7 @@
 ---
 description: Check every page of a website against a document (Word / PDF / image) for spelling, grammar, punctuation and content mismatches. Run it again after developers fix things to re-check automatically.
 argument-hint: [website-link] [document-path]   (both optional after the first run; --fresh starts over)
-allowed-tools: Bash, Read, Write, Edit
+allowed-tools: Bash, Read, Write, Edit, mcp__claude-in-chrome__tabs_context_mcp, mcp__claude-in-chrome__tabs_create_mcp, mcp__claude-in-chrome__navigate, mcp__claude-in-chrome__get_page_text, mcp__claude-in-chrome__tabs_close_mcp
 ---
 
 You are running **SkillCrawl**. The user may be non-technical: be friendly, use plain words, never
@@ -42,6 +42,22 @@ If it prints `NEEDS_SETUP`, ask the user in plain words for what is missing:
    Word, PDF, Excel, CSV and images all work, and you can give several."
 Optionally ask for brand names that should never be flagged (`--ignore "Name1,Name2"`).
 For a Google link, tell them it must be shared as "Anyone with the link can view".
+
+### Private Google link (fallback: Claude in Chrome)
+
+Before the first `auto` of every run, delete old copies: `rm -rf .skillcrawl/browser_docs`.
+If `auto` prints `DOC_PRIVATE=<link>` and `BROWSER_DOC_FILE=<path>`, the link is not shared publicly.
+Do not stop - read it through the user's own signed-in Chrome (needs the Claude in Chrome extension):
+1. `tabs_context_mcp` (createIfEmpty), then `tabs_create_mcp` for a new tab.
+2. Open a plain-text view of the link with `navigate`: a Google Doc
+   `https://docs.google.com/document/d/<id>/mobilebasic`; a Google Sheet
+   `https://docs.google.com/spreadsheets/d/<id>/htmlview`. (Other Drive files: skip to the fallback below.)
+3. `get_page_text` on that tab. Write the text, unchanged and complete, to `BROWSER_DOC_FILE`
+   (make the folder first). Keep headings on their own lines. Close the tab with `tabs_close_mcp`.
+4. Run `python3 "$SC" auto` again (add `--fresh` only if it was used the first time).
+If the browser tools are missing, the page asks the user to sign in, or the text is empty, tell the user
+in plain words: share the link as "Anyone with the link", or download the file and give it instead.
+Never type passwords or sign in for the user.
 
 ## Step 2 - Follow what `auto` printed
 

@@ -1,7 +1,7 @@
 ---
 description: Re-check the website after developers have fixed the issues (same as running /skillcrawl again).
 argument-hint: (no arguments)
-allowed-tools: Bash, Read, Write, Edit
+allowed-tools: Bash, Read, Write, Edit, mcp__claude-in-chrome__tabs_context_mcp, mcp__claude-in-chrome__tabs_create_mcp, mcp__claude-in-chrome__navigate, mcp__claude-in-chrome__get_page_text, mcp__claude-in-chrome__tabs_close_mcp
 ---
 
 Run the SkillCrawl re-check. This is exactly the same workflow as `/skillcrawl`: follow every step

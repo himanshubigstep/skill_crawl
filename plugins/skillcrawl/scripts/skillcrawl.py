@@ -347,6 +347,13 @@ def _download_link(src):
     ctype = r.headers.get("content-type", "").lower()
     if r.status_code != 200 or ("text/html" in ctype and "accounts.google" in r.url + r.text[:3000]) \
             or (ext and "text/html" in ctype):
+        # private link: use the text Claude in Chrome copied from the signed-in browser, if present
+        cached = os.path.join(WORK, "browser_docs", "doc_" + sha(src)[:10] + ".txt")
+        if os.path.exists(cached):
+            _DOC_CACHE[src] = cached
+            return cached
+        print(f"DOC_PRIVATE={src}")
+        print(f"BROWSER_DOC_FILE={cached}")
         die("The document link needs permission. In Google, click Share -> General access -> "
             "'Anyone with the link' (Viewer) and try again - or download the file "
             "(File -> Download) and give me the file instead.")
