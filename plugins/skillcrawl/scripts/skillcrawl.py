@@ -389,6 +389,67 @@ def _download_link(src):
     return path
 
 
+SKIP_LINK_RE = re.compile(r"figma\.com|/drive/folders/", re.I)
+DOC_LINK_RE = re.compile(r"docs\.google\.com/document/d/|drive\.google\.com/file/d/", re.I)
+
+
+def sheet_link_documents(xlsx_path, tabs):
+    """Every document link in the chosen tabs of a tracker sheet -> [(label, link)].
+    Figma links and Drive folders are skipped. The label is 'row name' or, under a header row of
+    hotel / section names, 'header - row name', so each doc is matched to its own page."""
+    import openpyxl
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    want = {t.strip().lower() for t in tabs}
+    found, seen = [], set()
+    for ws in wb.worksheets:
+        if ws.title.strip().lower() not in want:
+            continue
+        headers = {}
+        for row in ws.iter_rows():
+            vals = [("" if c.value is None else str(c.value).strip()) for c in row]
+            links = [c.hyperlink.target if c.hyperlink and c.hyperlink.target else "" for c in row]
+            if not vals or not any(vals):
+                continue
+            if not vals[0] and sum(1 for v in vals[1:] if v) >= 2 and not any(links):
+                headers = {i: v for i, v in enumerate(vals) if v and i > 0}
+                continue
+            for i, link in enumerate(links):
+                if not link or SKIP_LINK_RE.search(link) or not DOC_LINK_RE.search(link) or link in seen:
+                    continue
+                seen.add(link)
+                name = (vals[0] or vals[i] or "document").splitlines()[0].strip()
+                head = headers.get(i, "")
+                found.append((f"{head} - {name}" if head else name, link))
+    return found
+
+
+def _sheet_link_items(src, cfg):
+    """Expand a Google Sheet / Excel tracker into the documents it links to (config: sheet_link_tabs)."""
+    tabs = cfg.get("sheet_link_tabs") or []
+    if not tabs:
+        return None
+    if re.match(r"^https?://", src, re.I):
+        if not re.search(r"docs\.google\.com/spreadsheets/", src):
+            return None
+        path = _download_link(src)
+    elif src.lower().endswith((".xlsx", ".xlsm")) and os.path.isfile(src):
+        path = src
+    else:
+        return None
+    links = sheet_link_documents(path, tabs)
+    if not links:
+        die("No document links found in tab(s): " + ", ".join(tabs) + ". Check the tab name.")
+    print(f"SHEET_LINKS={len(links)} (Figma links and folders skipped)", flush=True)
+    items = []
+    for label, link in links:
+        local = _download_link(link)
+        dst = os.path.join(WORK, "source", safe_label(label) + os.path.splitext(local)[1])
+        if os.path.abspath(local) != os.path.abspath(dst):
+            shutil.copyfile(local, dst)
+        items.append((safe_label(label), dst))
+    return items
+
+
 def local_documents(cfg):
     """Return [(label, local_path)] for every document QA shared. The label is the file name
     without its extension and is what is matched to a website page."""
@@ -404,7 +465,12 @@ def local_documents(cfg):
         items.append((label, path))
 
     for src in doc_sources(cfg):
-        if re.match(r"^https?://", src, re.I):
+        expanded = _sheet_link_items(src, cfg)
+        if expanded is not None:
+            for label, path in expanded:
+                used.add(label)
+                items.append((label, path))
+        elif re.match(r"^https?://", src, re.I):
             add(_download_link(src))
         elif os.path.isdir(src):
             for f in sorted(os.listdir(src)):
@@ -892,6 +958,8 @@ def cmd_setup(args):
     if args.doc:
         docs = [d.strip() for d in args.doc if d.strip()]
         cfg["document"] = docs[0] if len(docs) == 1 else docs
+    if args.sheet_links:
+        cfg["sheet_link_tabs"] = [t.strip() for t in args.sheet_links.split(",") if t.strip()]
     if args.pages:
         cfg["page_urls"] = [u.strip() for u in args.pages.split(",") if u.strip()]
     if args.all_pages:
@@ -1585,6 +1653,8 @@ def main():
     s.add_argument("--all-pages", action="store_true",
                    help="with several files: also check every other page of the site")
     s.add_argument("--pages", help="comma-separated page URLs / paths to check (instead of all)")
+    s.add_argument("--sheet-links", help="comma-separated tab name(s) of a tracker sheet: open every "
+                   "document link in those tabs (Figma links skipped) and check the site against them")
     s.add_argument("--ignore", help="comma-separated brand names / terms to never flag")
     s.set_defaults(fn=cmd_setup)
     m = sub.add_parser("map")

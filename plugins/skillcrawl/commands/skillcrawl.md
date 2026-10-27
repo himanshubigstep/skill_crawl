@@ -29,6 +29,13 @@ If `$ARGUMENTS` (or the user's message) contains a website link and/or documents
 `python3 "$SC" setup --url "<link>" --doc "<file1>" "<file2>" ...` (pass only what you have).
 Quote paths that contain spaces. The website link is the one that is not a document.
 
+If the document is a **tracker Google Sheet / Excel that links to the real content docs** (e.g. a
+"Content Plan" tab with one Google Doc link per page), do NOT download them by hand: pass the tab
+name(s) with `--sheet-links "Content Plan"` (the user says which tab holds the content links; default
+to the tab named like "Content"). The engine opens every document link in that tab, skips Figma links,
+Drive folders and "Redirection to Taj" rows, and names each file "<hotel> - <page>" (or just the page
+name) so it is matched to its own website page. Tell the user how many links it found (`SHEET_LINKS`).
+
 If the user wants only certain pages checked while sharing ONE document (e.g. "Homepage, About
 Us, Dining"), work out the matching URLs from the site's menu and pass `--pages "/path1,/path2"`.
 With SEVERAL files only the matched pages are checked; add `--all-pages` to also check the rest of
