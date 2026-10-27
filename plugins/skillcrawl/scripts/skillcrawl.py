@@ -109,6 +109,7 @@ DEFAULT_CONFIG = {
     "use_sitemap": True,
     "respect_robots": True,
     "render_js": False,
+    "expand_collapsed": True,
     "strip_query": True,
     "delay_seconds": 0.2,
     "timeout_seconds": 20,
@@ -502,12 +503,64 @@ def load_document(cfg, state):
 
 
 # ---------------------------------------------------------------- fetching
-def fetch_js(url, timeout):
+EXPAND_JS = """
+async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const seen = new Set();
+  for (let round = 0; round < 3; round++) {
+    const targets = [];
+    document.querySelectorAll('[aria-expanded="false"], .MuiAccordionSummary-root').forEach(e => {
+      if (e.getAttribute('aria-expanded') !== 'true') targets.push(e);
+    });
+    document.querySelectorAll('img[alt*="more" i], img[alt*="expand" i], img[alt*="plus" i]').forEach(e => {
+      targets.push(e.closest('[contenteditable], button, [role=button]') || e);
+    });
+    document.querySelectorAll('button, [role=button], span, div').forEach(e => {
+      if (e.children.length === 0 && /^(read|show|view|see)\\s+more$|^expand( all)?$/i.test(e.textContent.trim()) && !e.closest('a[href]')) targets.push(e);
+    });
+    let clicked = 0;
+    for (const t of targets) {
+      if (seen.has(t)) continue;
+      seen.add(t);
+      try { t.click(); clicked++; await sleep(250); } catch (e) {}
+    }
+    if (!clicked) break;
+  }
+}
+"""
+
+
+_BROWSER_READY = False
+
+
+def _ensure_browser():
+    """Install playwright + Chromium on first use (needed to open collapsed text)."""
+    global _BROWSER_READY
+    if _BROWSER_READY:
+        return
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        subprocess.call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"])
+    subprocess.call([sys.executable, "-m", "playwright", "install", "chromium"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _BROWSER_READY = True
+
+
+def fetch_js(url, timeout, expand=False):
+    """Render the page in a real browser. With expand=True, open every collapsed block
+    (show more / read more / expand icons, accordions) so hidden text is checked too."""
+    _ensure_browser()
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
         resp = page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+        if expand:
+            try:
+                page.evaluate(EXPAND_JS)
+            except Exception:
+                pass
         html = page.content()
         status = resp.status if resp else 0
         browser.close()
@@ -517,9 +570,14 @@ def fetch_js(url, timeout):
 def fetch(url, cfg):
     """Return (status_code, html, error_string)."""
     try:
-        if cfg["render_js"]:
-            status, html = fetch_js(url, cfg["timeout_seconds"])
-            return status, html, ""
+        if cfg["render_js"] or cfg.get("expand_collapsed"):
+            try:
+                status, html = fetch_js(url, cfg["timeout_seconds"], expand=cfg.get("expand_collapsed", False))
+                return status, html, ""
+            except Exception:
+                if cfg["render_js"]:
+                    raise
+                # no browser available: fall back to a plain download (collapsed text stays hidden)
         r = requests.get(url, headers={"User-Agent": UA}, timeout=cfg["timeout_seconds"])
         ctype = r.headers.get("content-type", "")
         if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
@@ -528,6 +586,30 @@ def fetch(url, cfg):
         return r.status_code, r.text, ""
     except Exception as e:  # network errors etc.
         return 0, "", f"{type(e).__name__}: {e}"
+
+
+BLOCK_TAGS = {"p", "div", "li", "ul", "ol", "section", "article", "td", "th", "tr", "table", "header",
+              "footer", "nav", "main", "aside", "form", "br", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def _block_of(node):
+    for parent in node.parents:
+        if parent.name in BLOCK_TAGS:
+            return parent
+    return None
+
+
+def _join_inline_sentences(body):
+    """Inline pieces of one paragraph (spans) are shown together by the browser. Join a piece to
+    the previous one when a sentence ends with no space, so 'luxury.Beautiful' stays visible."""
+    nodes = [n for n in body.find_all(string=True) if n.strip()]
+    for prev, node in zip(nodes, nodes[1:]):
+        if (re.search(r"[.!?]\u200b?$", prev) and re.match(r"[A-Za-z]", node.lstrip("\u200b"))
+                and _block_of(prev) is _block_of(node) and _block_of(prev) is not None
+                and not prev.endswith((" ", "\n")) and not node.startswith((" ", "\n"))):
+            joined = str(prev) + str(node)
+            prev.replace_with("")
+            node.replace_with(NavigableString(joined))
 
 
 def extract_page(html, url):
@@ -549,6 +631,7 @@ def extract_page(html, url):
             h1 = txt
         h.clear()
         h.append(NavigableString(f"[{h.name.upper()}] {txt}"))
+    _join_inline_sentences(body)
     text = body.get_text("\n", strip=True)
     text = re.sub(r"\n{3,}", "\n\n", text)
     out = [f"URL: {url}", f"TITLE: {title}", f"META_DESCRIPTION: {meta_desc}",
@@ -566,7 +649,7 @@ def get_page(url, cfg):
     res = {"status": status, "html": html, "error": err, "text": "", "name": "", "warning": ""}
     if status == 200 and html:
         res["text"], res["name"] = extract_page(html, url)
-        if not cfg["render_js"] and len(res["text"]) < 450 and html.lower().count("<script") >= 3:
+        if not cfg["render_js"] and not cfg.get("expand_collapsed") and len(res["text"]) < 450 and html.lower().count("<script") >= 3:
             try:
                 s2, h2 = fetch_js(url, cfg["timeout_seconds"])
                 if s2 == 200 and h2:
