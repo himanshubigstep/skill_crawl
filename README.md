@@ -27,47 +27,60 @@ and SkillCrawl re-checks, tells you what is fixed, what is still open, and what 
    ```
 4. Close Claude Code and open it again (restart).
 
-### How QA gives the website and the document
+### How QA gives the website and the document(s)
 
-There is no upload button. QA just **types a link or a file name** after `/skillcrawl`
-(or answers Claude's two questions). Three ways to give the document:
+There is no upload button. QA just **types a link and the file names** after `/skillcrawl`
+(or answers Claude's two questions).
 
-| Document is... | What QA types as the document |
+**One document** for the whole site, or **several documents - one per page**:
+
+| QA has... | What QA types |
 |---|---|
-| A file on your computer (Word, PDF, Excel, CSV, image) | Put it in the project folder and type its name: `content.docx` - or the full path: `C:\Users\me\Downloads\content.pdf` |
-| A **Google Sheet / Google Doc / Google Slides** | Paste the link from the browser address bar. First click **Share -> General access -> "Anyone with the link"** (Viewer). |
-| A PDF / Word file in **Google Drive** | Same: set to "Anyone with the link", paste the link. |
-| Any file with a direct download link | Paste the link. |
+| One file (Word, PDF, Excel, CSV, image) | `content.docx` |
+| **Several files, one per page** | `Homepage.docx About-Us.docx Dining.pdf` - or just the **folder** that contains them: `docs` |
+| A Google Sheet / Doc / Drive file | paste the link (Share -> "Anyone with the link") |
+| A mix of files and links | list them all, separated by spaces |
 
-The website is always a link: `https://yoursite.com` (start from the home page).
+**The file name is the page name.** SkillCrawl looks at the website (page address, menu names,
+page titles) and matches each file to its page by name - `Homepage.docx` to the home page,
+`About-Us.docx` to `/about-us`, `Dining.pdf` to the page the menu calls "Dining", and so on. Then
+each page is checked against **its own file only**. It prints the pairs it found, so QA can check
+them; a wrong or missing pair is fixed by telling Claude ("Dining.pdf belongs to /restaurants").
+A file with no matching page on the website is reported as **"Page missing from the website"**.
+
+With several files, only the matching pages are checked. To check the rest of the site as well
+(spelling and grammar only), say so: "also check all other pages".
 
 Examples:
 
 ```
 /skillcrawl https://yoursite.com content.pdf
-/skillcrawl https://yoursite.com https://docs.google.com/spreadsheets/d/1AbC.../edit
-/skillcrawl https://yoursite.com "C:\Users\me\Desktop\site content.docx"
+/skillcrawl https://yoursite.com docs
+/skillcrawl https://yoursite.com Homepage.docx About-Us.docx Wellness.pdf
+/skillcrawl https://yoursite.com https://docs.google.com/document/d/1AbC.../edit "C:\\Users\\me\\Dining.docx"
 ```
 
 Notes:
-- **Google links are downloaded again on every run**, so when the client edits the Sheet, the
-  next `/skillcrawl` re-check automatically uses the new content.
+- **Google links are downloaded again on every run**, so when the client edits the Doc, the next
+  `/skillcrawl` re-check automatically uses the new content.
 - If a Google link is private, SkillCrawl tells you in plain words to change the sharing
-  setting - or use **File -> Download** (as `.xlsx`, `.docx` or `.pdf`) and give it the file.
+  setting - or use **File -> Download** and give it the file.
 - **Google Sheet layout:** any layout works, but it reads best with one row per page, e.g.
-  column A = page name, column B = the content for that page. Each tab is read as a section.
+  column A = page name, column B = the content. Links inside cells are kept.
 - Old `.doc` / `.xls` files: open them and **Save As** `.docx` / `.xlsx` first.
+- To check only some pages of the website with ONE document, tell Claude which pages
+  ("only Homepage, About Us and Dining").
 
 ### Part B - Run the first check (QA)
 
 1. Create a folder for the project, for example `website-check`.
-2. Put the document in that folder (e.g. `content.docx`, `content.pdf`, `content.xlsx` or
-   `content.png`) - or have its Google link ready (see the section above).
+2. Put the document(s) in that folder - one file, or one file per page named after the page
+   (`Homepage.docx`, `About-Us.docx`...) - or have the Google links ready (see the section above).
 3. Open a terminal **inside that folder** and type `claude`.
 4. Type `/skillcrawl` and press Enter.
    - Claude asks **"What is the website link?"** - paste it, e.g. `https://yoursite.com`
-   - Claude asks **"Where is the document?"** - type the file name (`content.docx`) or paste the
-     Google Sheet / Doc / Drive link
+   - Claude asks **"Which document(s)?"** - type the file name(s) (`Homepage.docx About-Us.docx`),
+     the folder name, or paste the Google Sheet / Doc / Drive links
    - Shortcut: type both at once - `/skillcrawl https://yoursite.com content.docx`
 5. Wait. Claude finds every page, reads them five at a time, and shows progress such as
    *"Checked 10 of 24 pages - 7 issues so far"*. Do not close the window until it finishes.
@@ -79,31 +92,32 @@ Notes:
 
 ### Part C - Give the issues to developers (QA)
 
-Pick whichever way your team works:
+Pick whichever way your team works (the HTML report is the easiest to read; the Excel file is best for assigning):
 
 | Way | What to do |
 |---|---|
 | **Send the report file** | Email or chat `skillcrawl-reports/FIX_REPORT.html` to the developer. It opens in any browser, nothing to install. |
-| **Excel / Google Sheets** | Send `skillcrawl-reports/FIX_REPORT.csv`. Upload it to Google Sheets or open it in Excel. Fill the `assignee` column to give each row to a person. |
-| **Tickets (Jira, ClickUp, etc.)** | One CSV row = one ticket. Import the CSV, or create one ticket per **page** and paste that page's rows. |
+| **Excel / Google Sheets** | Send `skillcrawl-reports/FIX_REPORT.xlsx` (open in Excel or upload to Google Sheets). Fill the `Assignee` column to give each row to a person. |
+| **Tickets (Jira, ClickUp, etc.)** | One row = one ticket. Import `FIX_REPORT.csv`, or create one ticket per **page** and paste that page's rows. |
 | **Shared folder / Git** | Put the whole `skillcrawl-reports` folder in the team's shared drive or repo. |
 
 Tell the developer:
 
-> "Open the report. For each **page**, find the **Section**, replace the text in *Currently says*
-> with the text in *Change it to / action*, and publish. Fix the **high** priority rows first."
+> "Open the report. For each **page**, go to the **section** named on each card, replace the red
+> text with the green text (or paste the green text for 'Add content'), and tick Done. Start with
+> the **high priority** cards."
 
 **What the developer does with each row**
 
-1. Open the page link shown at the top of the card.
-2. Find the **section** named in the row (it is the heading on that page).
-3. Find the exact text under **Currently says** (shown struck through).
-4. Replace it with the text under **Change it to / action** (shown in green).
+1. Click **Open page** at the top of the page's section.
+2. Find the **section** named on the card (it is the heading on that page).
+3. Find the text in the **red box** (the changed words are struck through).
+4. Replace it with the text in the **green box**.
 5. If the row says **Page missing from website**, create that page - it is in the document but
    not on the website. If it says **Page broken / not loading**, fix the page or remove the link
    pointing to it.
-6. Optional: type your name in `assignee` and `done` in `dev_status` in the CSV. These notes are
-   kept the next time QA re-checks.
+6. Tick **Done** on the card. Optional: type your name in `Assignee` and `Dev status` in the Excel
+   file - these notes are kept the next time QA re-checks.
 
 ### Part D - After developers say "fixed" (QA re-check)
 
@@ -146,16 +160,37 @@ name and run `/skillcrawl` again - every page is re-checked against the new docu
 
 ## What the developer sees
 
-`FIX_REPORT.html` lists each **page** (with its link), and under it every problem as one row:
+Open `FIX_REPORT.html` in any browser. It is built so a developer can work straight down the page:
 
-| Section on page | Currently says | Change it to / action | Type | Priority | Status |
-|---|---|---|---|---|---|
-| Opening Hours | ~~9 AM - 5 PM~~ | **9 AM - 6 PM** (Document: Home: Opening hours) | Does not match document | high | NEW |
+1. **Summary boxes** - how many things to fix, how many are high priority, new, fixed.
+2. **"Pages and what needs doing"** - one row per page (click to jump), with counts.
+3. **One section per page**, with an **Open page** link, split in two:
+   - **Fix text already on the page** - listed top-to-bottom in the order they appear on the page.
+   - **Add what is missing** - complete text to paste, taken from the document.
+4. **Each item is a numbered card**: `#12  REPLACE TEXT  HIGH PRIORITY  NEW`, then
+   **Where on the page** (the section heading), a one-line **instruction**
+   ("Change the closing time from 5 PM to 6 PM."), and two boxes side by side:
 
-It also lists the pages that were checked (so QA can confirm nothing was skipped), what was fixed
-since last time, and website pages that the document does not mention. `FIX_REPORT.csv` has the
-same rows plus empty `assignee`, `dev_status` and `dev_notes` columns - what developers type
-there is kept in the next re-check. Older reports are kept in `skillcrawl-reports/history/`.
+   | CURRENTLY ON THE SITE (red) | CHANGE IT TO (green) |
+   |---|---|
+   | 9 AM - ~~5~~ PM | 9 AM - **6** PM |
+
+   The changed words are highlighted, so even a long paragraph shows exactly what differs. Below
+   the boxes: why it is wrong, which document file/section it comes from, and the issue ID.
+5. A **Done** tick box on every card (remembered in the browser while the developer works).
+6. At the bottom: what was **fixed since last time**, and the list of **pages checked** so QA can
+   confirm nothing was skipped.
+
+Action labels: **Replace text** - change what is there; **Add content** - paste new text;
+**Create page** - the page is in the document but not on the website; **Fix page** - the page does
+not load; **Review & decide** - the document and site disagree and a person must choose.
+
+Other files in `skillcrawl-reports/`:
+- `FIX_REPORT.xlsx` - the same list as a formatted Excel / Google Sheets file (filters, wrapped text,
+  colored priority, plus `Assignee`, `Dev status`, `Dev notes` columns - what developers type there
+  is kept at the next re-check).
+- `FIX_REPORT.csv` - the same list for importing into Jira, ClickUp etc.
+- `FIX_REPORT.md` - plain-text copy. Older reports are kept in `skillcrawl-reports/history/`.
 
 ## What documents work
 
@@ -192,7 +227,7 @@ Every issue gets a stable ID (page + type + exact text).
 
 ## Optional settings (`skillcrawl.config.json`, created automatically)
 
-`ignore_terms` (brand names never to flag), `max_pages`, `exclude_patterns` (parts of the site to
+`page_urls` (check ONLY these pages, e.g. `["/en-in", "/en-in/about-us"]`; or run `/skillcrawl` and tell Claude which pages), `ignore_terms` (brand names never to flag), `max_pages`, `exclude_patterns` (parts of the site to
 skip, like `/blog`), `render_js` (sites that only show text with JavaScript - needs
 `pip install playwright && playwright install chromium`), `notify_webhook` (Slack message with the
 summary), `report_dir`.

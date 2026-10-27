@@ -22,6 +22,7 @@ Commands
   status                    show progress
 """
 import argparse
+import difflib
 import csv
 import hashlib
 import html as htmllib
@@ -35,7 +36,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections import deque
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, unquote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,6 +73,10 @@ _ensure_deps()
 import requests  # noqa: E402
 from bs4 import BeautifulSoup, NavigableString  # noqa: E402
 
+sys.path.insert(0, HERE)
+import report  # noqa: E402
+from report import SEV_ORDER, issue_row  # noqa: E402
+
 CONFIG_NAME = "skillcrawl.config.json"
 WORK = ".skillcrawl"
 STATE_PATH = os.path.join(WORK, "state.json")
@@ -83,6 +88,8 @@ SKIP_EXT = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".css", ".
             ".json", ".xml", ".pdf", ".zip", ".gz", ".mp4", ".mp3", ".woff", ".woff2",
             ".ttf", ".eot", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rss")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+SUPPORTED_DOC_EXT = (".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xls", ".csv", ".txt", ".md",
+                     ".html", ".htm") + IMG_EXT
 ISSUE_TYPES = {"spelling", "grammar", "punctuation", "content_mismatch", "missing_content",
                "missing_page", "consistency", "broken_page", "other"}
 TYPE_LABEL = {"spelling": "Spelling", "grammar": "Grammar", "punctuation": "Punctuation",
@@ -105,6 +112,10 @@ DEFAULT_CONFIG = {
     "strip_query": True,
     "delay_seconds": 0.2,
     "timeout_seconds": 20,
+    "page_urls": [],
+    "check_all_pages": False,
+    "match_depth": 1,
+    "match_pages": 60,
     "exclude_patterns": ["/wp-admin", "/wp-login", "/login", "/cart", "/checkout"],
     "ignore_terms": [],
     "report_dir": "./skillcrawl-reports",
@@ -231,12 +242,16 @@ def _extract_xlsx(path):
         import openpyxl
     except ImportError:
         die("openpyxl missing. Run: pip install openpyxl")
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    wb = openpyxl.load_workbook(path, data_only=True)
     parts = []
     for ws in wb.worksheets:
         parts.append(f"# [Sheet: {ws.title}]")
-        for row in ws.iter_rows(values_only=True):
-            cells = ["" if c is None else str(c).strip() for c in row]
+        for row in ws.iter_rows():
+            cells = []
+            for c in row:
+                v = "" if c.value is None else str(c.value).strip()
+                link = c.hyperlink.target if c.hyperlink and c.hyperlink.target else ""
+                cells.append(f"{v} <{link}>" if link and link not in v else v)
             if any(cells):
                 parts.append(" | ".join(cells).rstrip(" |"))
         parts.append("")
@@ -298,12 +313,28 @@ def _google_export_url(u):
     return u, ""
 
 
-def local_document(cfg):
-    """Return a local path for the document. Links (Google Sheet / Doc / Drive file / any
-    direct file link) are downloaded fresh on every run so edits are picked up."""
-    src = cfg["document"]
-    if not re.match(r"^https?://", src or "", re.I):
-        return src
+def doc_sources(cfg):
+    d = cfg.get("document")
+    return [os.path.expanduser(x) for x in (d if isinstance(d, list) else [d]) if x]
+
+
+def doc_display(cfg):
+    """Short, human-friendly list of the shared documents (file names, not full paths)."""
+    names = []
+    for x in doc_sources(cfg):
+        if re.match(r"^https?://", x, re.I):
+            names.append(x if len(x) < 60 else x[:57] + "...")
+        else:
+            names.append(os.path.basename(x.rstrip("/\\")) or x)
+    return ", ".join(names)
+
+
+def safe_label(label):
+    return re.sub(r"[^\w.-]+", "_", label).strip("_") or "document"
+
+
+def _download_link(src):
+    """Download a document link (Google Sheet / Doc / Drive file / direct link) fresh each run."""
     if src in _DOC_CACHE:
         return _DOC_CACHE[src]
     url, ext = _google_export_url(src)
@@ -318,12 +349,17 @@ def local_document(cfg):
         die("The document link needs permission. In Google, click Share -> General access -> "
             "'Anyone with the link' (Viewer) and try again - or download the file "
             "(File -> Download) and give me the file instead.")
+    cd = r.headers.get("content-disposition", "")
+    fname = ""
+    m = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", cd, re.I)
+    if m:
+        fname = unquote(m.group(1).strip().strip('"'))
+    else:
+        m = re.search(r'filename="?([^";]+)"?', cd, re.I)
+        if m:
+            fname = m.group(1)
     if not ext:
-        cd = r.headers.get("content-disposition", "")
-        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
-        ext = os.path.splitext(m.group(1))[1].lower() if m else ""
-        if not ext:
-            ext = os.path.splitext(urlparse(url).path)[1].lower()
+        ext = os.path.splitext(fname)[1].lower() or os.path.splitext(urlparse(url).path)[1].lower()
         if not ext:
             ext = {"application/pdf": ".pdf", "text/csv": ".csv", "image/png": ".png",
                    "image/jpeg": ".jpg", "text/plain": ".txt",
@@ -333,44 +369,87 @@ def local_document(cfg):
         if not ext:
             die("Could not tell what kind of file the document link is. Download it and give "
                 "me the file instead.")
+    stem = safe_label(os.path.splitext(fname)[0]) if fname else "document"
     os.makedirs(os.path.join(WORK, "source"), exist_ok=True)
-    path = os.path.join(WORK, "source", "document" + ext)
+    path, n = os.path.join(WORK, "source", stem + ext), 2
+    while path in _DOC_CACHE.values():
+        path = os.path.join(WORK, "source", f"{stem}_{n}{ext}")
+        n += 1
     with open(path, "wb") as f:
         f.write(r.content)
     _DOC_CACHE[src] = path
     return path
 
 
-def doc_files(path):
-    if os.path.isdir(path):
-        return sorted(os.path.join(path, f) for f in os.listdir(path)
-                      if not f.startswith(".") and os.path.isfile(os.path.join(path, f)))
-    return [path]
+def local_documents(cfg):
+    """Return [(label, local_path)] for every document QA shared. The label is the file name
+    without its extension and is what is matched to a website page."""
+    items, used = [], set()
+
+    def add(path):
+        label = os.path.splitext(os.path.basename(path))[0]
+        base, n = label, 2
+        while label in used:
+            label = f"{base}_{n}"
+            n += 1
+        used.add(label)
+        items.append((label, path))
+
+    for src in doc_sources(cfg):
+        if re.match(r"^https?://", src, re.I):
+            add(_download_link(src))
+        elif os.path.isdir(src):
+            for f in sorted(os.listdir(src)):
+                fp = os.path.join(src, f)
+                if f.startswith(".") or f.startswith("~$") or not os.path.isfile(fp):
+                    continue
+                if not f.lower().endswith(SUPPORTED_DOC_EXT):
+                    print(f"SKIPPED_FILE {f} (unsupported file type)")
+                    continue
+                add(fp)
+        elif os.path.exists(src):
+            add(src)
+        else:
+            die(f"Document not found: {src!r}. Check the file name / link you gave.")
+    if not items:
+        die("No documents found.")
+    return items
 
 
-def source_hash(path):
+
+
+
+def source_hash(items):
     h = hashlib.sha256()
-    for f in doc_files(path):
-        h.update(os.path.basename(f).encode())
-        with open(f, "rb") as fh:
+    for label, path in items:
+        h.update(label.encode())
+        with open(path, "rb") as fh:
             h.update(fh.read())
     return h.hexdigest()
 
 
-def extract_document(path):
-    """Return document text. Image / scanned pages appear as [[TRANSCRIBE: png]] markers."""
+def extract_document(items):
+    """Return document text. Several files -> '[File: name]' sections. Image / scanned pages
+    appear as [[TRANSCRIBE: png]] markers."""
     shutil.rmtree(IMG_DIR, ignore_errors=True)
     counter = [0]
-    files = doc_files(path)
-    if len(files) == 1:
-        return _extract_one(files[0], counter)
-    return "\n\n".join(f"[File: {os.path.basename(f)}]\n{_extract_one(f, counter)}" for f in files)
+    if len(items) == 1:
+        return _extract_one(items[0][1], counter)
+    return "\n\n".join(f"[File: {label}]\n{_extract_one(path, counter)}" for label, path in items)
 
 
 def write_doc_files(text):
     os.makedirs(WORK, exist_ok=True)
     with open(DOC_TXT, "w", encoding="utf-8") as f:
         f.write(text)
+    docs_dir = os.path.join(WORK, "docs")  # one text file per shared document
+    shutil.rmtree(docs_dir, ignore_errors=True)
+    parts = re.split(r"(?m)^\[File: (.+?)\][ \t]*$", text)
+    if len(parts) > 1:
+        os.makedirs(docs_dir, exist_ok=True)
+        for label, body in zip(parts[1::2], parts[2::2]):
+            with open(os.path.join(docs_dir, safe_label(label) + ".txt"), "w", encoding="utf-8") as f:
+                f.write(body.strip() + "\n")
     chunk_dir = os.path.join(WORK, "doc_chunks")
     os.makedirs(chunk_dir, exist_ok=True)
     for old in os.listdir(chunk_dir):
@@ -389,6 +468,15 @@ def write_doc_files(text):
     return len(chunks)
 
 
+def file_hashes():
+    d, out = os.path.join(WORK, "docs"), {}
+    if os.path.isdir(d):
+        for f in os.listdir(d):
+            with open(os.path.join(d, f), encoding="utf-8") as fh:
+                out[f[:-4]] = sha(fh.read())
+    return out
+
+
 def print_transcribe_request():
     with open(DOC_TXT, encoding="utf-8") as f:
         todo = TRANSCRIBE_RE.findall(f.read())
@@ -399,15 +487,13 @@ def print_transcribe_request():
 
 
 def load_document(cfg, state):
-    """Read the document. Returns (changed, needs_transcription)."""
-    path = local_document(cfg)
-    if not path or not os.path.exists(path):
-        die(f"Document not found: {cfg['document']!r}. Check the file name / link you gave.")
-    shash = source_hash(path)
+    """Read the document(s). Returns (changed, needs_transcription)."""
+    items = local_documents(cfg)
+    shash = source_hash(items)
     if state and state.get("doc_source_hash") == shash and os.path.exists(DOC_TXT) \
             and not state.get("awaiting_doc"):
-        return False, False  # same file as last time - keep existing text (incl. transcription)
-    text = extract_document(path)
+        return False, False  # same files as last time - keep existing text (incl. transcription)
+    text = extract_document(items)
     pending = bool(TRANSCRIBE_RE.search(text))
     if not pending and len(text.strip()) < 20:
         die("The document has no readable text.")
@@ -492,9 +578,31 @@ def get_page(url, cfg):
     return res
 
 
-def extract_links(html, base):
+_ANCHORS = {}   # normalized url -> link texts that point to it (menu labels etc.)
+_NAMES = {}     # normalized url -> page title / h1 seen while crawling
+
+
+def extract_links(html, base, cfg=None):
     soup = BeautifulSoup(html, "html.parser")
-    return [urljoin(base, a["href"]) for a in soup.find_all("a", href=True)]
+    if cfg is not None:
+        nb = norm_url(base, cfg)
+        if nb:
+            names = _NAMES.setdefault(nb, set())
+            if soup.title and soup.title.get_text(strip=True):
+                names.add(soup.title.get_text(" ", strip=True).split("|")[0].strip())
+            h1 = soup.find("h1")
+            if h1 and h1.get_text(strip=True):
+                names.add(h1.get_text(" ", strip=True))
+    out = []
+    for a in soup.find_all("a", href=True):
+        link = urljoin(base, a["href"])
+        out.append(link)
+        if cfg is not None:
+            txt = a.get_text(" ", strip=True)
+            nu = norm_url(link, cfg)
+            if nu and txt and len(txt) <= 60:
+                _ANCHORS.setdefault(nu, set()).add(txt)
+    return out
 
 
 # ------------------------------------------------------------- URL logic
@@ -570,7 +678,7 @@ def sitemap_urls(sm_url, cfg, out, depth=0, seen=None):
                 out.append(loc)
 
 
-def discover_urls(cfg):
+def discover_urls(cfg, max_depth=None, limit=None):
     """Find EVERY page: follow links from the home page AND merge in the sitemap.
 
     Using both means pages missing from the sitemap, and pages only reachable by link,
@@ -579,6 +687,15 @@ def discover_urls(cfg):
     start = norm_url(cfg["url"], cfg)
     if not start:
         die("Invalid website link.")
+    cap = limit or cfg["max_pages"]
+    depth_cap = cfg["max_depth"] if max_depth is None else max_depth
+    if cfg.get("page_urls"):  # QA asked for specific pages only -> no crawling
+        listed = [norm_url(urljoin(start + "/", u), cfg) for u in cfg["page_urls"]]
+        ordered = []
+        for u in listed:
+            if u and u not in ordered:
+                ordered.append(u)
+        return ordered, 0
     robots = load_robots(start, cfg)
 
     crawled = []
@@ -588,12 +705,12 @@ def discover_urls(cfg):
         if not allowed_url(url, start, cfg, robots):
             continue
         crawled.append(url)
-        if len(crawled) >= cfg["max_pages"] * 2:  # hard stop for runaway sites
+        if len(crawled) >= cap * 2:  # hard stop for runaway sites
             break
         status, html, _ = fetch(url, cfg)
         time.sleep(cfg["delay_seconds"])
-        if status == 200 and html and depth < cfg["max_depth"]:
-            for link in extract_links(html, url):
+        if status == 200 and html and depth < depth_cap:
+            for link in extract_links(html, url, cfg):
                 nu = norm_url(link, cfg)
                 if nu and nu not in seen:
                     seen.add(nu)
@@ -618,8 +735,54 @@ def discover_urls(cfg):
         if u not in seen_o:
             seen_o.add(u)
             ordered.append(u)
-    dropped = max(0, len(ordered) - cfg["max_pages"])
-    return ordered[: cfg["max_pages"]], dropped
+    dropped = max(0, len(ordered) - cap)
+    return ordered[:cap], dropped
+
+
+# ------------------------------------------------- file name -> website page
+_STOP = {"global", "page", "pages", "content", "doc", "docx", "final", "copy", "new", "v", "version",
+         "option", "options", "the", "of", "and", "for", "website", "web", "text", "copydeck", "draft"}
+_HOME_WORDS = {"home", "homepage", "landing", "index", "main"}
+
+
+def _tokens(s):
+    return [t for t in re.findall(r"[a-z0-9]+", s.lower()) if t not in _STOP and not t.isdigit()]
+
+
+def _score(ltoks, cand):
+    ctoks = _tokens(cand)
+    if not ctoks or not ltoks:
+        return 0.0
+    if set(ltoks) == set(ctoks):
+        return 1.0
+    return difflib.SequenceMatcher(None, " ".join(ltoks), " ".join(ctoks)).ratio()
+
+
+def match_files(labels, urls, start, existing=None):
+    """Match document file names to website pages using the URL path, menu / link text and page
+    titles. Returns {label: {"url": url-or-"", "score": float, "how": "auto"}}."""
+    out = {}
+    for label in labels:
+        if existing and existing.get(label, {}).get("url"):
+            out[label] = existing[label]
+            continue
+        lt = _tokens(label)
+        if lt and set(lt) <= _HOME_WORDS:
+            out[label] = {"url": start, "score": 1.0, "how": "auto"}
+            continue
+        best = (0.0, "", 99)
+        for u in urls:
+            if u == start:
+                continue
+            seg = urlparse(u).path.strip("/").split("/")[-1].replace("-", " ").replace("_", " ")
+            depth = len([x for x in urlparse(u).path.split("/") if x])
+            for c in ([seg] if seg else []) + list(_ANCHORS.get(u, ())) + list(_NAMES.get(u, ())):
+                sc = _score(lt, c)
+                if sc > best[0] + 1e-9 or (abs(sc - best[0]) < 1e-9 and sc > 0 and depth < best[2]):
+                    best = (sc, u, depth)
+        ok = best[0] >= 0.75
+        out[label] = {"url": best[1] if ok else "", "score": round(best[0], 2), "how": "auto"}
+    return out
 
 
 # -------------------------------------------------------------- commands
@@ -637,18 +800,24 @@ def cmd_setup(args):
             u = ("http://" if local else "https://") + u
         cfg["url"] = u
     if args.doc:
-        cfg["document"] = args.doc.strip()
+        docs = [d.strip() for d in args.doc if d.strip()]
+        cfg["document"] = docs[0] if len(docs) == 1 else docs
+    if args.pages:
+        cfg["page_urls"] = [u.strip() for u in args.pages.split(",") if u.strip()]
+    if args.all_pages:
+        cfg["check_all_pages"] = True
     if args.ignore:
         cfg["ignore_terms"] = [t.strip() for t in args.ignore.split(",") if t.strip()]
     with open(CONFIG_NAME, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
-    print(f"CONFIG_SAVED url={cfg.get('url')} document={cfg.get('document')}")
+    print(f"CONFIG_SAVED url={cfg.get('url')} documents={len(doc_sources(cfg))}")
 
 
 def new_state(cfg, urls, shash, text):
     return {
-        "created": now(), "url": cfg["url"], "document": cfg["document"],
+        "created": now(), "url": cfg["url"], "document": doc_display(cfg),
         "doc_hash": sha(text), "doc_source_hash": shash, "awaiting_doc": False,
+        "multi_doc": False, "file_map": {}, "file_hashes": {},
         "run": 1, "mode": "initial", "batch_counter": 0, "open_batch": None,
         "run_seen": {}, "coverage_run": 0, "coverage": [],
         "pages": {u: {"status": "pending", "hash": None, "checked_run": 0, "name": ""}
@@ -657,28 +826,78 @@ def new_state(cfg, urls, shash, text):
     }
 
 
-def cmd_prepare(args, quiet=False):
-    cfg = load_config({"url": getattr(args, "url", None), "document": getattr(args, "doc", None)})
+def print_file_map(state):
+    if not state.get("multi_doc"):
+        return
+    n_ok = sum(1 for m in state["file_map"].values() if m.get("url"))
+    print(f"DOCUMENT_FILES={len(state['file_map'])} MATCHED={n_ok}")
+    for label, m in state["file_map"].items():
+        if m.get("url"):
+            print(f"FILE_MATCH {label} -> {m['url']}  (match {int(m.get('score', 0) * 100)}%, {m.get('how', 'auto')})")
+        else:
+            print(f"FILE_UNMATCHED {label}  (best guess too weak; use: map --file \"{label}\" --url <page>)")
+
+
+def cmd_prepare(args):
+    cfg = load_config({"url": getattr(args, "url", None)})
+    if getattr(args, "doc", None):
+        cfg["document"] = args.doc
     if os.path.exists(STATE_PATH) and not args.force:
         die("A previous run exists. Use /skillcrawl (re-check) or /skillcrawl --fresh.")
     if not cfg["url"]:
         die("No website link set.")
     changed, pending = load_document(cfg, None)
+    items = local_documents(cfg)
+    multi = len(items) > 1
     with open(DOC_TXT, encoding="utf-8") as f:
         text = f.read()
-    print("Finding every page on the website (this can take a minute)...", flush=True)
-    urls, dropped = discover_urls(cfg)
-    state = new_state(cfg, urls, source_hash(local_document(cfg)), text)
-    state["awaiting_doc"] = pending
+    print("Finding the pages on the website (this can take a minute)...", flush=True)
+    start = norm_url(cfg["url"], cfg)
+    fmap, dropped = {}, 0
+    if multi and not cfg["check_all_pages"]:
+        urls, _ = discover_urls(cfg, max_depth=cfg["match_depth"], limit=cfg["match_pages"])
+        fmap = match_files([l for l, _p in items], urls, start)
+        page_list = []
+        for m in fmap.values():
+            if m["url"] and m["url"] not in page_list:
+                page_list.append(m["url"])
+    else:
+        page_list, dropped = discover_urls(cfg)
+        if multi:
+            fmap = match_files([l for l, _p in items], page_list, start)
+    state = new_state(cfg, page_list, source_hash(items), text)
+    state.update({"multi_doc": multi, "file_map": fmap, "file_hashes": file_hashes(),
+                  "awaiting_doc": pending})
     save_state(state)
     print(f"DOC_CHARS={len(text)}")
-    print(f"PAGES_FOUND={len(urls)}")
-    print(f"BATCHES_EXPECTED={-(-len(urls) // cfg['batch_size'])}")
+    print(f"PAGES_TO_CHECK={len(page_list)}")
+    print(f"BATCHES_EXPECTED={-(-len(page_list) // cfg['batch_size'])}")
+    print_file_map(state)
     if dropped:
         print(f"WARNING_PAGES_CAPPED={dropped} more pages exist than max_pages "
               f"({cfg['max_pages']}). Raise max_pages in {CONFIG_NAME} to check them all.")
     if pending:
         print_transcribe_request()
+
+
+def cmd_map(args):
+    """Tell the plugin which website page a document file belongs to (fixes a wrong / missing match)."""
+    cfg = load_config()
+    state = load_state()
+    want = args.file.strip().lower()
+    labels = [l for l in state["file_map"] if l.lower() == want or safe_label(l).lower() == want]
+    labels = labels or [l for l in state["file_map"] if want in l.lower()]
+    if len(labels) != 1:
+        die(f"Could not pick one document from {args.file!r}. Documents: {', '.join(state['file_map'])}")
+    u = args.url.strip()
+    if not re.match(r"^https?://", u, re.I):
+        u = urljoin(cfg["url"], u if u.startswith("/") else "/" + u)
+    nu = norm_url(u, cfg)
+    state["file_map"][labels[0]] = {"url": nu, "score": 1.0, "how": "manual"}
+    pg = state["pages"].setdefault(nu, {"status": "pending", "hash": None, "checked_run": 0, "name": ""})
+    pg["status"] = "pending"
+    save_state(state)
+    print(f"MAPPED {labels[0]} -> {nu}")
 
 
 def pending_urls(state):
@@ -695,6 +914,7 @@ def cmd_doc_ready(_):
             + ", ".join(left[:5]))
     write_doc_files(text)
     state["doc_hash"] = sha(text)
+    state["file_hashes"] = file_hashes()
     state["awaiting_doc"] = False
     save_state(state)
     print("DOC_READY")
@@ -727,7 +947,8 @@ def cmd_next_batch(_):
         res = get_page(url, cfg)
         time.sleep(cfg["delay_seconds"])
         entry = {"url": url, "name": res["name"], "http_status": res["status"],
-                 "error": res["error"], "file": None, "hash": None, "warning": res["warning"]}
+                 "error": res["error"], "file": None, "hash": None, "warning": res["warning"],
+                 "docs": docs_for(state, url)}
         if res["status"] == 200 and res["text"]:
             fpath = os.path.join(bdir, f"page_{i}.txt")
             with open(fpath, "w", encoding="utf-8") as f:
@@ -747,6 +968,14 @@ def cmd_next_batch(_):
     print_batch(bdir, state)
 
 
+def docs_for(state, url):
+    """Document text file(s) this page must be compared with."""
+    if not state.get("multi_doc"):
+        return [DOC_TXT]
+    return [os.path.join(WORK, "docs", safe_label(l) + ".txt")
+            for l, m in state["file_map"].items() if m.get("url") == url]
+
+
 def print_batch(bdir, state):
     with open(os.path.join(bdir, "manifest.json"), encoding="utf-8") as f:
         m = json.load(f)
@@ -757,7 +986,8 @@ def print_batch(bdir, state):
     print(f"IGNORE_TERMS={json.dumps(m['ignore_terms'])}")
     for p in m["pages"]:
         if p["file"]:
-            print(f"PAGE file={p['file']} url={p['url']}")
+            docs = ",".join(p.get("docs") or []) or "NONE (check spelling / grammar only)"
+            print(f"PAGE file={p['file']} url={p['url']} document={docs}")
             if p.get("warning"):
                 print(f"PAGE_WARNING url={p['url']} {p['warning']}")
         else:
@@ -802,46 +1032,29 @@ def find_section(raw_text, found):
     return sec
 
 
-CSV_COLS = ["issue_id", "status", "severity", "type", "page_name", "page_url", "section",
-            "found_text", "suggestion", "source_reference", "explanation", "first_seen_run",
-            "assignee", "dev_status", "dev_notes"]
-SEV_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
-def write_csv(path, rows):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig: opens cleanly in Excel
-        w = csv.DictWriter(f, fieldnames=CSV_COLS, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
 
 
-def read_dev_columns(path):
-    """Keep what developers typed (assignee / status / notes) across re-runs."""
-    keep = {}
-    if os.path.exists(path):
-        try:
-            with open(path, newline="", encoding="utf-8-sig") as f:
-                for r in csv.DictReader(f):
-                    if r.get("issue_id"):
-                        keep[r["issue_id"]] = {k: r.get(k, "") for k in
-                                               ("assignee", "dev_status", "dev_notes")}
-        except Exception:
-            pass
-    return keep
 
 
-def issue_row(iid, it, label, keep=None):
-    dev = (keep or {}).get(iid, {})
-    return {"issue_id": iid, "status": label, "severity": it.get("severity", "medium"),
-            "type": it["type"], "page_name": it.get("page_name", ""), "page_url": it["page_url"],
-            "section": it.get("section", ""), "found_text": it.get("found_text", ""),
-            "suggestion": it.get("suggestion", ""),
-            "source_reference": it.get("source_reference", ""),
-            "explanation": it.get("explanation", ""), "first_seen_run": it.get("first_seen_run", ""),
-            "assignee": dev.get("assignee", ""), "dev_status": dev.get("dev_status", ""),
-            "dev_notes": dev.get("dev_notes", "")}
+
+
+
+
+
+def find_pos(raw_text, found, section):
+    """Position of the issue on the page (lets the report list fixes top-to-bottom)."""
+    joined = " ".join(n for n in (norm(l) for l in raw_text.split("\n")) if n)
+    if found:
+        i = joined.find(norm(found))
+        if i >= 0:
+            return i
+    if section:
+        i = joined.find(norm(section))
+        if i >= 0:
+            return i
+    return 10 ** 9
 
 
 def cmd_submit(args):
@@ -870,14 +1083,15 @@ def cmd_submit(args):
             page_text[p["url"]] = norm(page_raw[p["url"]])
     run = state["run"]
     ignore = {t.lower() for t in cfg["ignore_terms"]}
-    accepted, dropped = [], []
+    ignore_words = {w for t in ignore for w in re.findall(r"[\w'-]+", t)}
+    accepted, dropped, ignored = [], [], []
 
     # automatic issues for pages that could not be fetched
     for p in manifest["pages"]:
         if not p["file"]:
             accepted.append({"page_url": p["url"], "page_name": p.get("name") or "Broken link: " + (urlparse(p["url"]).path or "/"),
                              "section": "Whole page", "type": "broken_page", "severity": "high",
-                             "found_text": f"HTTP {p['http_status']}",
+                             "found_text": f"HTTP {p['http_status']}", "pos": 0,
                              "suggestion": "This page does not load. Fix the page or remove the "
                                            "link that points to it.",
                              "explanation": p["error"]})
@@ -896,15 +1110,18 @@ def cmd_submit(args):
         if not found and itype not in ("missing_content", "content_mismatch", "consistency", "other"):
             dropped.append((url, "no found_text"))
             continue
-        if itype == "spelling" and norm(found).lower() in ignore:
-            continue
-        if any(t and t in norm(found).lower() for t in ignore) and itype in ("spelling", "grammar"):
+        # brand names / jargon: only a SHORT spelling flag that is (or contains) an ignored term
+        words = re.findall(r"[\w'-]+", found.lower())
+        if itype == "spelling" and words and all(w in ignore_words for w in words):
+            ignored.append((url, found))
             continue
         sev = it.get("severity", "medium")
         sev = sev if sev in SEV_ORDER else "medium"
         section = find_section(page_raw[url], found) or it.get("section", "") or ""
         accepted.append({"page_url": url, "page_name": page_name.get(url, ""), "section": section,
                          "type": itype, "severity": sev, "found_text": found,
+                         "pos": find_pos(page_raw[url], found, section),
+                         "instruction": it.get("instruction", ""),
                          "suggestion": it.get("suggestion", ""),
                          "source_reference": it.get("source_reference", ""),
                          "explanation": it.get("explanation", "")})
@@ -935,12 +1152,14 @@ def cmd_submit(args):
     state["open_batch"] = None
     save_state(state)
 
-    write_csv(os.path.join(cfg["report_dir"], "batches", manifest["batch_id"] + ".csv"), rows)
+    report.write_csv(os.path.join(cfg["report_dir"], "batches", manifest["batch_id"] + ".csv"), rows)
     print(f"SUBMITTED {manifest['batch_id']}: {len(rows)} issues recorded "
           f"({sum(1 for r in rows if r['status'] == 'new')} new, "
           f"{sum(1 for r in rows if r['status'] == 'regressed')} reopened)")
     for url, why in dropped:
         print(f"DROPPED_ISSUE {url}: {why}")
+    for url, txt in ignored:
+        print(f"IGNORED_BY_ignore_terms {url}: {txt!r}")
     print(f"PENDING_PAGES={len(pending_urls(state))}")
 
 
@@ -955,12 +1174,8 @@ def cmd_pages(_):
     print(f"PAGES_LISTED={n}  (doc-vs-website coverage: write {COVERAGE_PATH})")
 
 
-def cmd_coverage_submit(_):
-    state = load_state()
-    if not os.path.exists(COVERAGE_PATH):
-        die(f"{COVERAGE_PATH} not found. Write it (use [] if the document has no page list).")
-    with open(COVERAGE_PATH, encoding="utf-8") as f:
-        cov = json.load(f)
+def record_coverage(state, cov):
+    """cov = [{doc_page, url|"" , note}] - one entry per document page / file."""
     run = state["run"]
     known = set(state["pages"])
     missing = 0
@@ -974,9 +1189,10 @@ def cmd_coverage_submit(_):
         if not name:
             continue
         it = {"page_url": MISSING_PAGE_URL, "page_name": name, "section": "",
-              "type": "missing_page", "severity": "high", "found_text": "",
-              "suggestion": f"Create / publish the page \"{name}\" - it is in the document but "
-                            f"was not found anywhere on the website.",
+              "type": "missing_page", "severity": "high", "found_text": "", "pos": 10 ** 9,
+              "page_name": re.sub(r"[-_]+", " ", name).strip(),
+              "suggestion": f"Create and publish the page \"{name}\". Its content is in the document "
+                            f"\"{c.get('note') or name}\". No matching page was found on the website.",
               "source_reference": c.get("note", "") or name,
               "explanation": "Document page with no matching page on the website.",
               "first_seen_run": run, "status": "open", "last_seen_run": run}
@@ -991,104 +1207,25 @@ def cmd_coverage_submit(_):
         missing += 1
     state["coverage"] = cov
     state["coverage_run"] = run
+    return missing
+
+
+def cmd_coverage_submit(_):
+    state = load_state()
+    if not os.path.exists(COVERAGE_PATH):
+        die(f"{COVERAGE_PATH} not found. Write it (use [] if the document has no page list).")
+    with open(COVERAGE_PATH, encoding="utf-8") as f:
+        cov = json.load(f)
+    missing = record_coverage(state, cov)
     save_state(state)
     print(f"COVERAGE_SAVED document_pages={len(cov)} missing_on_website={missing}")
 
 
 # ---------------------------------------------------------------- reports
-def build_html(title, meta_lines, groups, fixed, pages_table, extra_pages, all_clear):
-    e = htmllib.escape
-    css = ("body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#f4f5f7;"
-           "color:#1d2433}main{max-width:1000px;margin:0 auto;padding:24px 16px 60px}"
-           "h1{margin:0 0 4px}h2{margin:32px 0 8px}.meta{color:#5b6475;font-size:14px}"
-           ".card{background:#fff;border:1px solid #dfe3ea;border-radius:10px;margin:14px 0;"
-           "padding:16px}.card h3{margin:0}.url{font-size:13px;color:#5b6475;word-break:break-all}"
-           "table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}"
-           "th,td{text-align:left;vertical-align:top;padding:8px;border-top:1px solid #e8ebf0}"
-           "th{font-size:12px;text-transform:uppercase;color:#5b6475}"
-           ".b{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600}"
-           ".high{background:#fde2e2;color:#a31515}.medium{background:#fff0cc;color:#8a5a00}"
-           ".low{background:#e4ecff;color:#1f4fb0}.new{background:#e1f5e5;color:#1b6b34}"
-           ".still_open{background:#eee;color:#444}.regressed{background:#fde2e2;color:#a31515}"
-           ".bad{background:#fff3f3;border-color:#f0b9b9}.ok{background:#effaf1;border-color:#b7e1c1}"
-           "del{background:#fde2e2}ins{background:#dff5e3;text-decoration:none;font-weight:600}"
-           ".sec{font-weight:600}small{color:#5b6475}")
-    h = [f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
-         f"content='width=device-width,initial-scale=1'><title>{e(title)}</title>"
-         f"<style>{css}</style></head><body><main>",
-         f"<h1>{e(title)}</h1>"]
-    for m in meta_lines:
-        h.append(f"<div class='meta'>{e(m)}</div>")
-    if all_clear:
-        h.append("<div class='card ok'><h3>All clear - no open issues. Nothing for developers "
-                 "to fix.</h3></div>")
-    else:
-        h.append("<h2>What developers need to fix</h2>")
-        h.append("<div class='meta'>Grouped by website page. For each row: go to the page, find "
-                 "the section, and change the text as shown.</div>")
-    for g in groups:
-        h.append(f"<div class='card bad'><h3>Page: {e(g['name'])}</h3>"
-                 f"<div class='url'>{e(g['url'])}</div><table><tr><th>#</th><th>Section on page"
-                 f"</th><th>Currently says</th><th>Change it to / action</th><th>Type</th>"
-                 f"<th>Priority</th><th>Status</th></tr>")
-        for i, r in enumerate(g["rows"], 1):
-            cur = e(r["found_text"]) if r["found_text"] else "<small>(missing)</small>"
-            ref = (f"<br><small>Document: {e(r['source_reference'])}</small>"
-                   if r["source_reference"] else "")
-            why = f"<br><small>{e(r['explanation'])}</small>" if r["explanation"] else ""
-            h.append(f"<tr><td>{i}</td><td class='sec'>{e(r['section'] or '-')}</td>"
-                     f"<td><del>{cur}</del></td><td><ins>{e(r['suggestion'])}</ins>{ref}{why}</td>"
-                     f"<td>{e(TYPE_LABEL.get(r['type'], r['type']))}</td>"
-                     f"<td><span class='b {r['severity']}'>{e(r['severity'])}</span></td>"
-                     f"<td><span class='b {r['raw_status']}'>{e(r['status'])}</span>"
-                     f"<br><small>ID {e(r['issue_id'])}</small></td></tr>")
-        h.append("</table></div>")
-    if fixed:
-        h.append(f"<h2>Fixed since last run ({len(fixed)})</h2><div class='card ok'><table>"
-                 "<tr><th>Page</th><th>Section</th><th>Was</th></tr>")
-        for r in fixed:
-            h.append(f"<tr><td>{e(r['page_name'])}</td><td>{e(r['section'] or '-')}</td>"
-                     f"<td>{e(r['found_text'] or r['suggestion'])}</td></tr>")
-        h.append("</table></div>")
-    h.append(f"<h2>Pages checked ({len(pages_table)})</h2><div class='card'><table><tr>"
-             "<th>Page</th><th>URL</th><th>Open issues</th></tr>")
-    for name, url, n in pages_table:
-        badge = f"<span class='b high'>{n}</span>" if n else "OK"
-        h.append(f"<tr><td>{e(name)}</td><td class='url'>{e(url)}</td>"
-                 f"<td>{badge}</td></tr>")
-    h.append("</table></div>")
-    if extra_pages:
-        h.append("<h2>Website pages not mentioned in the document (for information)</h2>"
-                 "<div class='card'><ul>")
-        for name, url in extra_pages:
-            h.append(f"<li>{e(name)} - <span class='url'>{e(url)}</span></li>")
-        h.append("</ul></div>")
-    h.append("</main></body></html>")
-    return "\n".join(h)
 
 
-def build_md(title, meta_lines, groups, fixed, all_clear):
-    L = [f"# {title}", ""] + [f"_{m}_  " for m in meta_lines] + [""]
-    if all_clear:
-        L.append("**ALL CLEAR - no open issues.**")
-    for g in groups:
-        L += [f"## Page: {g['name']}", f"{g['url']}", ""]
-        for i, r in enumerate(g["rows"], 1):
-            L.append(f"{i}. **Section:** {r['section'] or '-'} | **{TYPE_LABEL.get(r['type'], r['type'])}**"
-                     f" ({r['severity']}) | {r['status']} | ID {r['issue_id']}")
-            if r["found_text"]:
-                L.append(f"   - Currently says: \"{r['found_text']}\"")
-            L.append(f"   - Change to / action: {r['suggestion']}")
-            if r["source_reference"]:
-                L.append(f"   - Document: {r['source_reference']}")
-            if r["explanation"]:
-                L.append(f"   - Why: {r['explanation']}")
-        L.append("")
-    if fixed:
-        L += [f"## Fixed since last run ({len(fixed)})"]
-        L += [f"- {r['page_name']} / {r['section'] or '-'}: {r['found_text'] or r['suggestion']}"
-              for r in fixed]
-    return "\n".join(L)
+
+
 
 
 def cmd_finalize(_):
@@ -1100,7 +1237,10 @@ def cmd_finalize(_):
     pend = pending_urls(state)
     if pend:
         die(f"{len(pend)} pages still pending. Keep running next-batch.")
-    if state.get("coverage_run") != run:
+    if state.get("multi_doc"):  # coverage comes straight from the file -> page matching
+        record_coverage(state, [{"doc_page": l, "url": m.get("url", ""), "note": l}
+                                for l, m in state["file_map"].items()])
+    elif state.get("coverage_run") != run:
         print("WARNING_COVERAGE_NOT_DONE: run `pages`, write coverage.json, then "
               "`coverage-submit` so missing document pages are reported.")
 
@@ -1121,49 +1261,66 @@ def cmd_finalize(_):
     save_state(state)
 
     rdir = cfg["report_dir"]
-    keep = read_dev_columns(os.path.join(rdir, "FIX_REPORT.csv"))
+    keep = report.read_dev_columns(rdir)
+    cov_name = ({c["url"]: re.sub(r"[-_]+", " ", c["doc_page"]).strip()
+                 for c in state.get("coverage", [])
+                 if c.get("url") and c.get("doc_page")} if state.get("coverage_run") == run else {})
     rows = []
     for iid, it in state["issues"].items():
-        if it["status"] == "open":
-            label = state["run_seen"].get(iid, "still_open")
-            r = issue_row(iid, it, STATUS_LABEL[label], keep)
-            r["raw_status"] = label
-            rows.append(r)
+        if it["status"] != "open":
+            continue
+        label = state["run_seen"].get(iid, "still_open")
+        r = issue_row(iid, it, STATUS_LABEL[label], keep)
+        r["raw_status"] = label
+        # show pages under the names used in the document (e.g. "Homepage"), not the HTML heading
+        if r["page_url"] in cov_name:
+            r["page_name"] = cov_name[r["page_url"]]
+        rows.append(r)
     counts = {k: sum(1 for r in rows if r["raw_status"] == k)
               for k in ("new", "still_open", "regressed")}
     fixed_rows = [issue_row(i, state["issues"][i], "FIXED") for i in fixed_ids]
+    for r in fixed_rows:
+        r["page_name"] = cov_name.get(r["page_url"], r["page_name"])
 
-    groups = {}
-    for r in rows:
-        g = groups.setdefault(r["page_url"], {"name": r["page_name"] or r["page_url"],
-                                              "url": r["page_url"], "rows": []})
-        g["rows"].append(r)
-    glist = sorted(groups.values(),
-                   key=lambda g: (min(SEV_ORDER.get(r["severity"], 1) for r in g["rows"]), g["name"]))
-    for g in glist:
-        g["rows"].sort(key=lambda r: (SEV_ORDER.get(r["severity"], 1), r["section"]))
-    rows = [r for g in glist for r in g["rows"]]
+    # group by page, in the order the pages were listed / checked; number the items 1..N
+    order = {u: i for i, u in enumerate(state["pages"])}
+    by_page = {}
+    for r in sorted(rows, key=lambda r: order.get(r["page_url"], 10 ** 6)):
+        g = by_page.setdefault(r["page_url"], {"name": r["page_name"] or r["page_url"],
+                                               "url": r["page_url"], "items": []})
+        g["items"].append(r)
+    groups, n = [], 0
+    for g in by_page.values():
+        ordered = report.order_rows(g["items"])
+        for r in ordered:
+            n += 1
+            r["no"] = n
+        g["fix"] = [r for r in ordered if report.action_of(r) not in ("ADD", "CREATE PAGE")]
+        g["add"] = [r for r in ordered if report.action_of(r) in ("ADD", "CREATE PAGE")]
+        groups.append(g)
+    rows = [r for g in groups for r in g["fix"] + g["add"]]
 
-    open_by_page = {}
-    for r in rows:
-        open_by_page[r["page_url"]] = open_by_page.get(r["page_url"], 0) + 1
-    pages_table = [(p.get("name") or u, u, open_by_page.get(u, 0))
+    open_by_page = {g["url"]: len(g["fix"]) + len(g["add"]) for g in groups}
+    pages_table = [(cov_name.get(u) or p.get("name") or u, u, open_by_page.get(u, 0))
                    for u, p in state["pages"].items() if p["status"] == "done"]
     covered = {c.get("url") for c in state.get("coverage", []) if c.get("url")}
     extra_pages = ([(p.get("name") or u, u) for u, p in state["pages"].items()
                     if p["status"] == "done" and u not in covered]
-                   if state.get("coverage_run") == run and state.get("coverage") else [])
-
+                   if state.get("coverage_run") == run and state.get("coverage")
+                   and not state.get("multi_doc") else [])
     pages_checked = sum(1 for p in state["pages"].values() if p.get("checked_run") == run)
-    title = f"SkillCrawl fix report - run {run} ({'first check' if run == 1 else 're-check'})"
-    meta = [f"Website: {state['url']}", f"Document: {state['document']}", f"Generated: {now()}",
-            f"Pages on website: {len(state['pages'])} | read this run: {pages_checked}",
-            f"Open issues: {len(rows)} (new {counts['new']}, still open {counts['still_open']}, "
-            f"reopened {counts['regressed']}) | fixed since last run: {len(fixed_ids)}"]
+    stats = {"total": len(rows), "high": sum(1 for r in rows if r["severity"] == "high"),
+             "new": counts["new"], "still_open": counts["still_open"],
+             "regressed": counts["regressed"], "fixed": len(fixed_ids), "pages": pages_checked}
+    title = f"Website fix report - run {run} ({'first check' if run == 1 else 're-check'})"
+    meta = [f"Website: {state['url']}", f"Document(s): {doc_display(cfg)}", f"Generated: {now()}"]
     all_clear = not rows
+    pages_summary = [{"name": g["name"], "fix": len(g["fix"]), "add": len(g["add"]),
+                      "high": sum(1 for r in g["fix"] + g["add"] if r["severity"] == "high"),
+                      "total": len(g["fix"]) + len(g["add"])} for g in groups]
 
-    html_doc = build_html(title, meta, glist, fixed_rows, pages_table, extra_pages, all_clear)
-    md_doc = build_md(title, meta, glist, fixed_rows, all_clear)
+    html_doc = report.build_html(title, meta, stats, groups, fixed_rows, pages_table, extra_pages, all_clear)
+    md_doc = report.build_md(title, meta, stats, groups, fixed_rows, all_clear)
     hist = os.path.join(rdir, "history", f"run{run:02d}")
     for d in (rdir, hist):
         os.makedirs(d, exist_ok=True)
@@ -1171,10 +1328,11 @@ def cmd_finalize(_):
             f.write(html_doc)
         with open(os.path.join(d, "FIX_REPORT.md"), "w", encoding="utf-8") as f:
             f.write(md_doc)
-        write_csv(os.path.join(d, "FIX_REPORT.csv"), rows)
+        report.write_csv(os.path.join(d, "FIX_REPORT.csv"), rows)
+        report.write_xlsx(os.path.join(d, "FIX_REPORT.xlsx"), meta, pages_summary, rows)
 
-    line = (f"SkillCrawl run {run}: ALL CLEAR ({len(fixed_ids)} fixed)" if all_clear else
-            f"SkillCrawl run {run}: {len(rows)} open issues ({counts['new']} new, "
+    line = (f"Run {run}: ALL CLEAR ({len(fixed_ids)} fixed)" if all_clear else
+            f"Run {run}: {len(rows)} things to fix ({counts['new']} new, "
             f"{counts['still_open']} still open, {counts['regressed']} reopened), "
             f"{len(fixed_ids)} fixed. Report: {os.path.join(rdir, 'FIX_REPORT.html')}")
     if cfg["notify_webhook"]:
@@ -1187,15 +1345,16 @@ def cmd_finalize(_):
     print(f"NEW={counts['new']} STILL_OPEN={counts['still_open']} REOPENED={counts['regressed']} "
           f"FIXED={len(fixed_ids)}")
     print(line)
-    print(f"REPORT_HTML={os.path.join(rdir, 'FIX_REPORT.html')}")
-    print(f"REPORT_CSV={os.path.join(rdir, 'FIX_REPORT.csv')}")
+    for ext in ("html", "xlsx", "csv", "md"):
+        print(f"REPORT_{ext.upper()}={os.path.join(rdir, 'FIX_REPORT.' + ext)}")
 
 
 def start_recheck(cfg, state):
     """Prepare a re-check run. Returns False if the document needs transcription first."""
     changed, pending = load_document(cfg, state)
+    items = local_documents(cfg)
     if changed:
-        state["doc_source_hash"] = source_hash(local_document(cfg))
+        state["doc_source_hash"] = source_hash(items)
         state["force_all"] = True
     if pending:
         state["awaiting_doc"] = True
@@ -1204,7 +1363,9 @@ def start_recheck(cfg, state):
         return False
     with open(DOC_TXT, encoding="utf-8") as f:
         text = f.read()
-    doc_changed = state.pop("force_all", False) or sha(text) != state.get("doc_hash")
+    multi = state.get("multi_doc", False)
+    forced = state.pop("force_all", False)
+    doc_changed = forced if multi else (forced or sha(text) != state.get("doc_hash"))
     state["doc_hash"] = sha(text)
 
     state["run"] += 1
@@ -1213,7 +1374,32 @@ def start_recheck(cfg, state):
     state["run_seen"] = {}
     state["batch_counter"] = 0
 
-    urls, dropped = discover_urls(cfg)
+    force_urls, dropped = set(), 0
+    if multi:
+        start = norm_url(cfg["url"], cfg)
+        labels = [l for l, _p in items]
+        fmap = {l: m for l, m in state.get("file_map", {}).items() if l in labels}
+        todo = [l for l in labels if not fmap.get(l, {}).get("url")]
+        if todo:  # new or still-unmatched files: look for their pages again
+            urls0, _ = discover_urls(cfg, max_depth=cfg["match_depth"], limit=cfg["match_pages"])
+            fmap.update(match_files(todo, urls0, start))
+        for l in labels:
+            fmap.setdefault(l, {"url": "", "score": 0, "how": "auto"})
+        state["file_map"] = fmap
+        if cfg["check_all_pages"]:
+            urls, dropped = discover_urls(cfg)
+        else:
+            urls = []
+            for m in fmap.values():
+                if m["url"] and m["url"] not in urls:
+                    urls.append(m["url"])
+        cur = file_hashes()
+        old = state.get("file_hashes", {})
+        changed_labels = {safe_label(l) for l in labels if old.get(safe_label(l)) != cur.get(safe_label(l))}
+        force_urls = {m["url"] for l, m in fmap.items() if m["url"] and safe_label(l) in changed_labels}
+        state["file_hashes"] = cur
+    else:
+        urls, dropped = discover_urls(cfg)
     discovered = set(urls)
     for u in urls:
         state["pages"].setdefault(u, {"status": "pending", "hash": None, "checked_run": 0,
@@ -1225,6 +1411,10 @@ def start_recheck(cfg, state):
         if pg["status"] == "pending":
             n_pending += 1
             continue
+        if multi and not cfg["check_all_pages"] and url not in discovered:
+            pg["status"], pg["checked_run"] = "gone", run  # no document is mapped to it any more
+            n_gone += 1
+            continue
         res = get_page(url, cfg)
         time.sleep(cfg["delay_seconds"])
         if res["status"] in (404, 410) and url not in discovered:
@@ -1234,7 +1424,8 @@ def start_recheck(cfg, state):
             continue
         new_hash = sha(res["text"]) if res["status"] == 200 and res["text"] else None
         changed_page = new_hash != pg.get("hash")
-        if doc_changed or changed_page or url in open_pages or pg["status"] != "done":
+        if doc_changed or changed_page or url in open_pages or url in force_urls \
+                or pg["status"] != "done":
             pg["status"] = "pending"
             n_pending += 1
         else:
@@ -1242,8 +1433,9 @@ def start_recheck(cfg, state):
             n_skipped += 1
     save_state(state)
     print(f"RECHECK_RUN={run}")
-    print(f"DOCUMENT_CHANGED={doc_changed}")
+    print(f"DOCUMENT_CHANGED={doc_changed or bool(force_urls)}")
     print(f"PAGES_TO_CHECK={n_pending} UNCHANGED_SKIPPED={n_skipped} GONE={n_gone}")
+    print_file_map(state)
     if dropped:
         print(f"WARNING_PAGES_CAPPED={dropped} more pages exist than max_pages.")
     return True
@@ -1252,18 +1444,24 @@ def start_recheck(cfg, state):
 def cmd_auto(args):
     """One entry point for QA: decides first run / resume / re-check by itself."""
     if not os.path.exists(CONFIG_NAME):
-        print("NEEDS_SETUP: ask the user for the website link and the document path, "
-              "then run: setup --url <link> --doc <path>")
+        print("NEEDS_SETUP: ask the user for the website link and the document path(s), "
+              "then run: setup --url <link> --doc <path> [<path> ...]")
         return
     cfg = load_config()
-    if not cfg["url"] or not cfg["document"]:
-        print("NEEDS_SETUP: website link or document path missing in config.")
+    if not cfg["url"] or not doc_sources(cfg):
+        print("NEEDS_SETUP: website link or document missing in config.")
         return
-    if args.fresh or not os.path.exists(STATE_PATH):
+    state = None
+    if os.path.exists(STATE_PATH) and not args.fresh:
+        state = load_state()
+        multi_now = len(local_documents(cfg)) > 1
+        if state.get("url") != cfg["url"] or multi_now != state.get("multi_doc", False):
+            print("NOTE: the website or the number of documents changed - starting a new full check.")
+            state = None
+    if state is None:
         print("MODE=FIRST_RUN")
         cmd_prepare(argparse.Namespace(url=None, doc=None, force=True))
         return
-    state = load_state()
     if state.get("awaiting_doc"):
         print("MODE=NEEDS_DOCUMENT_TRANSCRIPTION")
         print_transcribe_request()
@@ -1271,6 +1469,7 @@ def cmd_auto(args):
     if state.get("open_batch") or pending_urls(state):
         print("MODE=RESUME")
         print(f"PAGES_PENDING={len(pending_urls(state))}")
+        print_file_map(state)
         return
     print("MODE=RECHECK")
     start_recheck(cfg, state)
@@ -1292,9 +1491,16 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("setup")
     s.add_argument("--url")
-    s.add_argument("--doc")
+    s.add_argument("--doc", nargs="+", help="one or more files / folders / links")
+    s.add_argument("--all-pages", action="store_true",
+                   help="with several files: also check every other page of the site")
+    s.add_argument("--pages", help="comma-separated page URLs / paths to check (instead of all)")
     s.add_argument("--ignore", help="comma-separated brand names / terms to never flag")
     s.set_defaults(fn=cmd_setup)
+    m = sub.add_parser("map")
+    m.add_argument("--file", required=True, help="document file name (as listed by auto)")
+    m.add_argument("--url", required=True, help="website page URL or path, e.g. /about-us")
+    m.set_defaults(fn=cmd_map)
     a = sub.add_parser("auto")
     a.add_argument("--fresh", action="store_true")
     a.set_defaults(fn=cmd_auto)

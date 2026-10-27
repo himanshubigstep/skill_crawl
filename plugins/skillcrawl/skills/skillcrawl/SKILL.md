@@ -74,3 +74,15 @@ When the engine asks for transcription, copy the text from the image **exactly a
 any typos, odd punctuation and numbers. Do not fix anything while transcribing - the document is the
 source of truth. If text is unreadable, write `[unreadable]` for that part and do not use it for
 checks.
+
+## Writing issues a developer can act on
+
+The report developers receive shows, per item: the page, the section, an instruction, a red box
+("currently on the site") and a green box ("change it to"). So:
+
+- `found_text` = the exact current text (a whole phrase / sentence, never cut mid-word).
+- `suggestion` = ONLY the final replacement text, or for missing content the complete text from
+  the document. No commentary in it - the report highlights the changed words by comparing the two.
+- `instruction` = one plain sentence ("Change the closing time from 5 PM to 6 PM."). Optional for
+  simple replacements - it is generated from found_text and suggestion.
+- Several documents: compare each page only with the file shown in its `document=` path.
