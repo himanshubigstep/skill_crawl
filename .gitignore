@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.skillcrawl/
+skillcrawl-reports/

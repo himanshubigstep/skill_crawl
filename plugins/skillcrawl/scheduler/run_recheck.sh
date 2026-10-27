@@ -9,8 +9,8 @@ cd "$PROJECT_DIR"
 LOG_DIR="$PROJECT_DIR/skillcrawl-reports"
 mkdir -p "$LOG_DIR"
 
-claude -p "/skillcrawl --recheck" \
-  --allowedTools "Bash" "Read" "Write" \
+claude -p "/skillcrawl" \
+  --allowedTools "Bash" "Read" "Write" "Edit" \
   >> "$LOG_DIR/scheduler.log" 2>&1
 
 echo "[$(date)] recheck finished" >> "$LOG_DIR/scheduler.log"

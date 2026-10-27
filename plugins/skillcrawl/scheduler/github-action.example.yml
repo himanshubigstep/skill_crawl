@@ -23,7 +23,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          claude --plugin-dir path/to/skillcrawl -p "/skillcrawl --recheck" \
+          claude --plugin-dir path/to/skillcrawl -p "/skillcrawl" \
             --allowedTools "Bash" "Read" "Write"
       - name: Save state and reports
         run: |

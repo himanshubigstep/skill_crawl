@@ -1,17 +1,6 @@
 {
-  "document": "./docs/content-source.pdf",
-  "url": "https://example.com",
-  "batch_size": 5,
-  "max_pages": 100,
-  "max_depth": 4,
-  "use_sitemap": true,
-  "respect_robots": true,
-  "render_js": false,
-  "strip_query": true,
-  "delay_seconds": 0.5,
-  "timeout_seconds": 20,
-  "exclude_patterns": ["/wp-admin", "/login", "/cart"],
-  "ignore_terms": ["YourBrand", "SKU-X"],
-  "report_dir": "./skillcrawl-reports",
-  "notify_webhook": ""
+  "document": "./content.docx",
+  "url": "https://yoursite.com",
+  "ignore_terms": ["YourBrand"],
+  "max_pages": 300
 }

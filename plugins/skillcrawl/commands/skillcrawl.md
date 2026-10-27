@@ -1,77 +1,103 @@
 ---
-description: Check every page of a website against a source document (spelling, grammar, punctuation, content match) in batches of 5 and write developer reports. Use --recheck to verify fixes.
-argument-hint: [--recheck] [--fresh] [--url URL] [--doc PATH]
-allowed-tools: Bash, Read, Write
+description: Check every page of a website against a document (Word / PDF / image) for spelling, grammar, punctuation and content mismatches. Run it again after developers fix things to re-check automatically.
+argument-hint: [website-link] [document-path]   (both optional after the first run; --fresh starts over)
+allowed-tools: Bash, Read, Write, Edit
 ---
 
-You are running **SkillCrawl**. Arguments given by the user: `$ARGUMENTS`
+You are running **SkillCrawl**. The user may be non-technical: be friendly, use plain words, never
+show raw errors or JSON without explaining them. Arguments: `$ARGUMENTS`
 
-The document and website are normally read from `skillcrawl.config.json` in the current
-project folder, so the user does NOT need to upload anything. Run the whole workflow
-below without stopping to ask questions (this may run unattended from a scheduler).
+Work through the steps WITHOUT stopping to ask questions, except in Step 1 (missing link /
+document). The same command is used for the first check AND for every later re-check.
 
-## Step 0 - Locate the engine script
+## Step 0 - Locate the engine
 
-Use `${CLAUDE_PLUGIN_ROOT}/scripts/skillcrawl.py`. If that path does not exist (variable
-empty), find it with:
-`find ~/.claude/plugins "$PWD" -name skillcrawl.py -path "*scripts*" 2>/dev/null | head -1`
+`SC="${CLAUDE_PLUGIN_ROOT}/scripts/skillcrawl.py"`. If that path does not exist, find it with
+`find ~/.claude/plugins "$PWD" -name skillcrawl.py -path "*scripts*" 2>/dev/null | head -1`.
+Always run `python3 "$SC" <command>` from the user's project folder. The engine installs its
+own Python packages on first use - do not ask the user to install anything.
 
-Call it `SC` below and always run it as `python3 "$SC" <command>` from the project folder.
-If Python complains about missing modules, run
-`pip install -r <plugin folder>/requirements.txt` once, then retry.
+## Step 1 - Setup (only if needed)
 
-If `skillcrawl.config.json` does not exist, run `python3 "$SC" init`, tell the user to edit
-the `document` and `url` fields, and STOP.
+If `$ARGUMENTS` contains a website link and/or a document (a file path - `.docx .pdf .xlsx .csv
+.png .jpg ...` or a folder of images - OR a link to a Google Sheet / Google Doc / Drive file /
+direct file link), save them. Two links: the one for the *website* is the website; the other (or
+any `docs.google.com` / `drive.google.com` link) is the document:
+`python3 "$SC" setup --url "<link>" --doc "<path>"` (pass only the ones you have).
 
-## Step 1 - Decide the mode
+Then run `python3 "$SC" auto` (add `--fresh` if the user passed `--fresh`).
+If it prints `NEEDS_SETUP`, ask the user in plain words for what is missing:
+1. "What is the website link?"  2. "Where is the document - a file name, or a link (Google Sheet,
+   Google Doc, Drive)? Word, PDF, Excel, CSV and images all work."
+(If the document is not in the project folder, ask them for the full path, or to drop the file
+into the folder. For a Google link, tell them it must be shared as "Anyone with the link can view"
+- the engine prints those steps itself if the link is private.) Optionally ask for brand names that should never be flagged
+(`--ignore "Name1,Name2"`). Run `setup`, then `auto` again.
 
-- `--recheck` in arguments -> run `python3 "$SC" recheck-start`, then go to Step 2.
-- `--fresh` in arguments (or `.skillcrawl/state.json` does not exist) -> run
-  `python3 "$SC" prepare --force` (add `--url`/`--doc` if the user passed them), then Step 2.
-- Otherwise, run `python3 "$SC" status`. If pages are still pending, resume at Step 2.
-  If the run is complete, tell the user to use `/skillcrawl --recheck` (verify fixes) or
-  `/skillcrawl --fresh` (start over) and STOP.
+## Step 2 - Follow what `auto` printed
 
-## Step 2 - Read the rules and the source document
+- `MODE=FIRST_RUN` - a new check started. Tell the user how many pages were found
+  (`PAGES_FOUND`). If a `WARNING_PAGES_CAPPED` line appears, tell them and how to raise `max_pages`.
+- `MODE=RECHECK` - re-check of an earlier run (developers have presumably fixed things).
+  Tell the user how many pages will be re-read (`PAGES_TO_CHECK`).
+- `MODE=RESUME` - an earlier run was interrupted; continue it.
+- `MODE=NEEDS_DOCUMENT_TRANSCRIPTION` or any output containing `DOC_NEEDS_TRANSCRIPTION=n` -
+  the document is an image or scan. For EVERY `DOC_IMAGE=<png>` line: `Read` that image (you can
+  see images) and replace its `[[TRANSCRIBE: <png>]]` marker inside `.skillcrawl/doc.txt` with the
+  complete text of the image, **exactly as printed - copy typos too, never correct them**. Keep
+  headings as lines starting with `# `. Then run `python3 "$SC" doc-ready`, then
+  `python3 "$SC" auto` again and follow its output.
 
-Read the `skillcrawl` skill (`skills/skillcrawl/SKILL.md` in the plugin folder) for the
-checking rubric. Then read `.skillcrawl/doc.txt` (the source-of-truth document). If it is
-very large (over ~40,000 characters), read `.skillcrawl/doc_chunks/*.txt` selectively per page
-instead.
+## Step 3 - Read the rules and the document
 
-## Step 3 - Batch loop (5 pages at a time)
+Read the `skillcrawl` skill (`skills/skillcrawl/SKILL.md`, next to `commands/`) for the checking
+rubric. Then read `.skillcrawl/doc.txt` (the source of truth). If it is over ~40,000 characters,
+read `.skillcrawl/doc_chunks/*.txt` selectively per page instead.
+
+## Step 4 - Batch loop (5 pages at a time, ALL pages)
 
 Repeat until the script prints `NO_MORE_BATCHES`:
 
-1. Run `python3 "$SC" next-batch`. It prints `BATCH_DIR`, one `PAGE file=... url=...` line per
-   page, and `WRITE_ISSUES_TO`.
-2. Read each page file in the batch and check it (rubric in the skill):
-   - spelling, grammar, commas, full stops and other punctuation
-   - content correctness against the source document
-3. Write a JSON array to the `WRITE_ISSUES_TO` path (use `[]` if the batch is clean).
-   Each issue is an object:
+1. `python3 "$SC" next-batch` prints `BATCH_DIR`, a `PAGE file=... url=...` line per page,
+   `PAGE_ERROR` lines for pages that did not load (the engine reports those automatically),
+   `PAGE_WARNING` lines, and `WRITE_ISSUES_TO`.
+2. `Read` every page file in the batch and check it (rubric in the skill): spelling, grammar,
+   commas, full stops and other punctuation, and content versus the document. Check the page
+   title, meta description and image alt text too - not only the body.
+3. Write a JSON array to the `WRITE_ISSUES_TO` path (`[]` if the batch is clean). Issue shape:
    ```json
    {
      "page_url": "exact URL from the PAGE line",
      "type": "spelling | grammar | punctuation | content_mismatch | missing_content | consistency | other",
      "severity": "high | medium | low",
      "found_text": "EXACT text copied verbatim from the page file (empty only for missing_content)",
-     "suggestion": "the corrected text, or what the document says",
-     "source_reference": "document section / [Page N] marker for content issues, else empty",
-     "explanation": "one short sentence"
+     "suggestion": "the exact corrected text a developer can paste in, or what the document says",
+     "source_reference": "document heading / [Page N] for content issues, else empty",
+     "explanation": "one short plain sentence"
    }
    ```
-   `found_text` MUST be copied exactly from the page file; the script drops issues whose
-   text it cannot find on the page.
-4. Run `python3 "$SC" submit <BATCH_DIR>`. It writes the batch report
-   (`skillcrawl-reports/runNN_batchNNN.csv` and `.md`) for developers.
-5. Print one short progress line (batch id, issues found, pages remaining) and continue.
+   `found_text` MUST be copied exactly from the page file, short but unique. The engine drops
+   issues whose text it cannot find on the page, and works out the page section by itself.
+4. `python3 "$SC" submit <BATCH_DIR>`.
+5. Print one short progress line ("Checked 10 of 24 pages - 7 issues so far") and continue.
 
-## Step 4 - Finish
+## Step 5 - Match the document's pages to the website's pages
 
-Run `python3 "$SC" finalize`. It marks fixed issues, writes `open_issues.csv` and the run
-summary, and prints either `ALL_CLEAR` or `OPEN_ISSUES=n`.
+Run `python3 "$SC" pages` (lists every page that was read: `name | url`). Read the document's
+page / section names. Write `.skillcrawl/coverage.json`: one entry per page or major section of
+the DOCUMENT:
+`[{"doc_page": "Careers", "url": "<matching website URL or null>", "note": "what the document says it contains"}]`
+Use `null` only when the website really has no such page. Write `[]` if the document has no
+page structure at all. Then `python3 "$SC" coverage-submit`.
 
-Final message to the user (keep it short): pages checked, issues new / still open /
-regressed / fixed, and the paths of `skillcrawl-reports/open_issues.csv` and the summary file.
-For a first run, remind them to hand the CSV to developers and later run `/skillcrawl --recheck`.
+## Step 6 - Finish
+
+`python3 "$SC" finalize` writes the developer report and prints `ALL_CLEAR` or `OPEN_ISSUES=n`.
+
+Final message to the user (short, plain, no jargon):
+- pages read (`PAGES_READ` of `PAGES_ON_SITE`) and the totals: new / still open / reopened / fixed
+- the report to open: `skillcrawl-reports/FIX_REPORT.html` (double-click it, or share it with the
+  developers) - and `FIX_REPORT.csv` for Excel
+- first run: "Send the report to your developers. When they say it is fixed, just run
+  `/skillcrawl` again."
+- re-check with open issues: list the headline numbers; ALL_CLEAR: say everything matches.

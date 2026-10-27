@@ -1,11 +1,14 @@
 {
   "name": "skillcrawl-marketplace",
-  "owner": { "name": "Your Team" },
+  "owner": {
+    "name": "Your Team"
+  },
   "plugins": [
     {
       "name": "skillcrawl",
       "source": "./plugins/skillcrawl",
-      "description": "Checks every page of a website against a source document (spelling, grammar, punctuation, factual match) in batches of 5 and generates developer reports, with re-check support."
+      "description": "Checks every page of a website against a Word / PDF / image document (spelling, grammar, punctuation, content match), writes page-by-page fix reports for developers, and re-checks on demand."
     }
-  ]
+  ],
+  "description": "Website vs document proofreading and content-matching for QA teams."
 }

@@ -12,6 +12,9 @@ do not report.
 ## What to check on every page
 
 Page files contain `TITLE`, `META_DESCRIPTION`, `BODY` and `IMAGE ALT TEXTS`. Check all of them.
+Headings in the body are tagged `[H1]`..`[H6]` so you can see the page structure. Never include
+the `[H2]` tag in `found_text`, and do not flag the tags themselves. The engine uses these tags to
+tell the developer which section of the page each issue is in.
 
 1. **Spelling** - misspelled words, wrong word forms, doubled words ("the the").
 2. **Grammar** - subject/verb agreement, tense, articles, plurals ("Our plans starts" ->
@@ -27,11 +30,15 @@ Page files contain `TITLE`, `META_DESCRIPTION`, `BODY` and `IMAGE ALT TEXTS`. Ch
    the document:
    - numbers, prices, dates, times, phone numbers, emails, addresses, percentages
    - names, titles, product names, specs, features, claims, policies
-   - `content_mismatch`: page says something that contradicts the document
+   - The document marks its pages / sections with `[Page N]` markers or `# Heading` lines; use
+  them to decide which part of the document belongs to which website page.
+- `content_mismatch`: page says something that contradicts the document
    - `missing_content`: the document says something the page should contain but does not
      (only when the page clearly covers that topic; do not report an absent topic as missing
      on unrelated pages)
    - Differences in wording that mean the same thing are NOT mismatches.
+   Page-level gaps (a document page that has no page on the website at all) are NOT reported
+   per batch - the coverage step after the batches handles them.
 5. If a page has no relation to the document (e.g. a cookie policy), only run checks 1-3.
 
 ## What NOT to flag
@@ -60,3 +67,10 @@ Page files contain `TITLE`, `META_DESCRIPTION`, `BODY` and `IMAGE ALT TEXTS`. Ch
 - `suggestion` must be the exact corrected text a developer can paste in.
 - For content issues put the document location in `source_reference`
   (e.g. "[Page 3] Pricing table").
+
+## Reading an image / scanned document
+
+When the engine asks for transcription, copy the text from the image **exactly as shown**, including
+any typos, odd punctuation and numbers. Do not fix anything while transcribing - the document is the
+source of truth. If text is unreadable, write `[unreadable]` for that part and do not use it for
+checks.

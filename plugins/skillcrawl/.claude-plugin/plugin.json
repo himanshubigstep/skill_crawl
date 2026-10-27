@@ -1,7 +1,5 @@
 {
   "name": "skillcrawl",
-  "version": "0.1.0",
-  "description": "Checks website pages against a source document for spelling, grammar, punctuation and content mismatches. Batches of 5 pages, developer reports, and re-check runs.",
-  "commands": ["commands/"],
-  "skills": ["skills/"]
+  "version": "0.2.0",
+  "description": "Checks website pages against a source document (Word, PDF or image) for spelling, grammar, punctuation and content mismatches. Reads every page, writes page-by-page developer fix reports, and re-checks on demand."
 }
