@@ -38,6 +38,7 @@ from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urldefrag, unquote
 
+import asyncio  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -112,6 +113,7 @@ DEFAULT_CONFIG = {
     "expand_collapsed": True,
     "strip_query": True,
     "delay_seconds": 0.2,
+    "concurrency": 4,
     "timeout_seconds": 20,
     "page_urls": [],
     "check_all_pages": False,
@@ -595,9 +597,10 @@ async () => {
     for (const t of targets) {
       if (seen.has(t)) continue;
       seen.add(t);
-      try { t.click(); clicked++; await sleep(250); } catch (e) {}
+      try { t.click(); clicked++; } catch (e) {}
     }
     if (!clicked) break;
+    await sleep(350);  // let the page open what was clicked (and any nested blocks)
   }
 }
 """
@@ -620,23 +623,50 @@ def _ensure_browser():
     _BROWSER_READY = True
 
 
-def fetch_js(url, timeout, expand=False):
-    """Render the page in a real browser. With expand=True, open every collapsed block
-    (show more / read more / expand icons, accordions) so hidden text is checked too."""
+async def _fetch_many_js(urls, timeout, expand, concurrency):
+    from playwright.async_api import async_playwright
+    results = {}
+    sem = asyncio.Semaphore(concurrency)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(user_agent=UA)
+
+        async def one(url):
+            async with sem:
+                page = await context.new_page()
+                try:
+                    resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                    try:  # let the page finish loading, but never wait on endless trackers
+                        await page.wait_for_load_state("networkidle", timeout=4000)
+                    except Exception:
+                        pass
+                    if expand:
+                        try:
+                            await page.evaluate(EXPAND_JS)
+                        except Exception:
+                            pass
+                    results[url] = (resp.status if resp else 0, await page.content(), "")
+                except Exception as e:
+                    results[url] = (0, "", f"{type(e).__name__}: {e}")
+                finally:
+                    await page.close()
+
+        await asyncio.gather(*(one(u) for u in urls))
+        await browser.close()
+    return results
+
+
+def fetch_many_js(urls, timeout, expand=False, concurrency=4):
+    """Open every URL in ONE headless Chromium (several tabs at once). With expand=True, open every
+    collapsed block (show more / read more / expand icons, accordions) so hidden text is checked."""
     _ensure_browser()
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        resp = page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
-        if expand:
-            try:
-                page.evaluate(EXPAND_JS)
-            except Exception:
-                pass
-        html = page.content()
-        status = resp.status if resp else 0
-        browser.close()
+    return asyncio.run(_fetch_many_js(list(urls), timeout, expand, concurrency))
+
+
+def fetch_js(url, timeout, expand=False):
+    status, html, err = fetch_many_js([url], timeout, expand)[url]
+    if err:
+        raise RuntimeError(err)
     return status, html
 
 
@@ -736,6 +766,38 @@ def get_page(url, cfg):
 
 _ANCHORS = {}   # normalized url -> link texts that point to it (menu labels etc.)
 _NAMES = {}     # normalized url -> page title / h1 seen while crawling
+
+
+def get_pages(urls, cfg):
+    """Fetch + extract many pages at once. Returns {url: result}. Plain downloads run in parallel
+    threads; pages that need the browser share ONE Chromium with several tabs."""
+    urls = list(dict.fromkeys(urls))
+    out = {}
+    if not urls:
+        return out
+    workers = max(1, int(cfg.get("concurrency", 4)))
+    use_js = cfg["render_js"] or cfg.get("expand_collapsed")
+    if use_js:
+        try:
+            raw = fetch_many_js(urls, cfg["timeout_seconds"], expand=bool(cfg.get("expand_collapsed")),
+                                concurrency=workers)
+        except Exception:
+            if cfg["render_js"]:
+                raise
+            raw = None  # no browser available: plain download below
+        if raw is not None:
+            for u in urls:
+                status, html, err = raw[u]
+                res = {"status": status, "html": html, "error": err, "text": "", "name": "", "warning": ""}
+                if status == 200 and html:
+                    res["text"], res["name"] = extract_page(html, u)
+                out[u] = res
+            return out
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for u, res in zip(urls, ex.map(lambda x: get_page(x, cfg), urls)):
+            out[u] = res
+    return out
 
 
 def extract_links(html, base, cfg=None):
@@ -855,22 +917,26 @@ def discover_urls(cfg, max_depth=None, limit=None):
     robots = load_robots(start, cfg)
 
     crawled = []
-    queue, seen = deque([(start, 0)]), {start}
-    while queue:
-        url, depth = queue.popleft()
-        if not allowed_url(url, start, cfg, robots):
-            continue
-        crawled.append(url)
-        if len(crawled) >= cap * 2:  # hard stop for runaway sites
-            break
-        status, html, _ = fetch(url, cfg)
-        time.sleep(cfg["delay_seconds"])
-        if status == 200 and html and depth < depth_cap:
-            for link in extract_links(html, url, cfg):
-                nu = norm_url(link, cfg)
-                if nu and nu not in seen:
-                    seen.add(nu)
-                    queue.append((nu, depth + 1))
+    seen = {start}
+    level, depth = [start], 0
+    crawl_cfg = dict(cfg, expand_collapsed=False)  # only links are needed here: no browser clicks
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, int(cfg.get("concurrency", 4)))
+    while level and len(crawled) < cap * 2:  # hard stop for runaway sites
+        level = [u for u in level if allowed_url(u, start, cfg, robots)][: cap * 2 - len(crawled)]
+        crawled.extend(level)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fetched = list(ex.map(lambda u: fetch(u, crawl_cfg), level))
+        nxt = []
+        if depth < depth_cap:
+            for url, (status, html, _) in zip(level, fetched):
+                if status == 200 and html:
+                    for link in extract_links(html, url, cfg):
+                        nu = norm_url(link, cfg)
+                        if nu and nu not in seen:
+                            seen.add(nu)
+                            nxt.append(nu)
+        level, depth = nxt, depth + 1
 
     from_sitemap = []
     if cfg["use_sitemap"]:
@@ -1101,9 +1167,9 @@ def cmd_next_batch(_):
     os.makedirs(bdir, exist_ok=True)
 
     pages = []
+    fetched = get_pages(urls, cfg)
     for i, url in enumerate(urls, 1):
-        res = get_page(url, cfg)
-        time.sleep(cfg["delay_seconds"])
+        res = fetched[url]
         entry = {"url": url, "name": res["name"], "http_status": res["status"],
                  "error": res["error"], "file": None, "hash": None, "warning": res["warning"],
                  "docs": docs_for(state, url)}
@@ -1565,6 +1631,9 @@ def start_recheck(cfg, state):
 
     open_pages = {it["page_url"] for it in state["issues"].values() if it["status"] == "open"}
     n_pending = n_skipped = n_gone = 0
+    to_fetch = [u for u, pg in state["pages"].items() if pg["status"] != "pending"
+                and not (multi and not cfg["check_all_pages"] and u not in discovered)]
+    fetched = get_pages(to_fetch, cfg)
     for url, pg in state["pages"].items():
         if pg["status"] == "pending":
             n_pending += 1
@@ -1573,8 +1642,7 @@ def start_recheck(cfg, state):
             pg["status"], pg["checked_run"] = "gone", run  # no document is mapped to it any more
             n_gone += 1
             continue
-        res = get_page(url, cfg)
-        time.sleep(cfg["delay_seconds"])
+        res = fetched[url]
         if res["status"] in (404, 410) and url not in discovered:
             # removed from the site AND nothing links to it any more -> closed
             pg["status"], pg["checked_run"] = "gone", run
