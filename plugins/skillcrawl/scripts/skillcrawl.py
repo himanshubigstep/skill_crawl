@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urldefrag, unquote
 
 import asyncio  # noqa: E402
+import threading  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -336,6 +337,9 @@ def safe_label(label):
     return re.sub(r"[^\w.-]+", "_", label).strip("_") or "document"
 
 
+_DL_LOCK = threading.Lock()
+
+
 def _download_link(src):
     """Download a document link (Google Sheet / Doc / Drive file / direct link) fresh each run."""
     if src in _DOC_CACHE:
@@ -381,13 +385,14 @@ def _download_link(src):
                 "me the file instead.")
     stem = safe_label(os.path.splitext(fname)[0]) if fname else "document"
     os.makedirs(os.path.join(WORK, "source"), exist_ok=True)
-    path, n = os.path.join(WORK, "source", stem + ext), 2
-    while path in _DOC_CACHE.values():
-        path = os.path.join(WORK, "source", f"{stem}_{n}{ext}")
-        n += 1
-    with open(path, "wb") as f:
-        f.write(r.content)
-    _DOC_CACHE[src] = path
+    with _DL_LOCK:  # downloads can run in parallel: pick a free file name and write it atomically
+        path, n = os.path.join(WORK, "source", stem + ext), 2
+        while path in _DOC_CACHE.values():
+            path = os.path.join(WORK, "source", f"{stem}_{n}{ext}")
+            n += 1
+        with open(path, "wb") as f:
+            f.write(r.content)
+        _DOC_CACHE[src] = path
     return path
 
 
@@ -442,9 +447,11 @@ def _sheet_link_items(src, cfg):
     if not links:
         die("No document links found in tab(s): " + ", ".join(tabs) + ". Check the tab name.")
     print(f"SHEET_LINKS={len(links)} (Figma links and folders skipped)", flush=True)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg.get("concurrency", 4)))) as ex:
+        locals_ = list(ex.map(_download_link, [link for _, link in links]))
     items = []
-    for label, link in links:
-        local = _download_link(link)
+    for (label, link), local in zip(links, locals_):
         dst = os.path.join(WORK, "source", safe_label(label) + os.path.splitext(local)[1])
         if os.path.abspath(local) != os.path.abspath(dst):
             shutil.copyfile(local, dst)
@@ -452,7 +459,18 @@ def _sheet_link_items(src, cfg):
     return items
 
 
+_LOCAL_DOCS = {}
+
+
 def local_documents(cfg):
+    """Cached per run: the same documents are asked for several times in one command."""
+    key = json.dumps([cfg.get("document"), cfg.get("sheet_link_tabs")], sort_keys=True)
+    if key not in _LOCAL_DOCS:
+        _LOCAL_DOCS[key] = _local_documents(cfg)
+    return list(_LOCAL_DOCS[key])
+
+
+def _local_documents(cfg):
     """Return [(label, local_path)] for every document QA shared. The label is the file name
     without its extension and is what is matched to a website page."""
     items, used = [], set()
